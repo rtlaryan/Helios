@@ -17,7 +17,7 @@ class TargetSpec:
     searchLatitudes: torch.Tensor  # [H, W] degrees
     searchLongitudes: torch.Tensor  # [H, W] degrees
     importanceMap: torch.Tensor  # [H, W] float
-    powerMap: torch.Tensor  # [H, W] bool/int
+    powerMap: torch.Tensor  # [H, W] floats
     hotspotCoordinates: torch.Tensor  # [num hotspots, 2] lat/lon coordinates of each hotspot
     thresholdDB: float = 10
 
