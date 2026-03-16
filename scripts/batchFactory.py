@@ -169,9 +169,8 @@ def sampleDirectedWeights(
         pass
 
     # The directionLocal vector points FROM the array TO the target.
-    # The wave vector should represent an incoming plane wave from the target.
-    # Therefore, we negate the direction vector.
-    waveVector = (2 * torch.pi / spec.wavelength) * (-directionLocal)
+    # We want the weights to focus the beam in this direction.
+    waveVector = (2 * torch.pi / spec.wavelength) * directionLocal
 
     phase = torch.einsum("bi,bin->bn", waveVector, localPositions)
     if spec.phaseJitterSTD > 0:

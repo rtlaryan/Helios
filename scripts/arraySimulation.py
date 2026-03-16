@@ -59,12 +59,14 @@ def arrayResponseCore(
         if chunkSize is None:
             chunkSize = gridSize
 
+        weightsConj = weights.conj().clone()
+
         fullResponse = []
         for chunk in range(0, gridSize, chunkSize):
             waveVectorChunk = waveVectorFlat[:, :, chunk : chunk + chunkSize]  # [B, 3, Pc]
             phaseChunk = torch.einsum("bin,bip->bnp", elementLocalPosition, waveVectorChunk)
             arrayManifoldChunk = torch.exp(1j * phaseChunk)
-            chunkResponse = torch.einsum("bn,bnp->bp", weights.conj(), arrayManifoldChunk)
+            chunkResponse = torch.einsum("bn,bnp->bp", weightsConj, arrayManifoldChunk)
             fullResponse.append(chunkResponse)
 
         fullResponse = torch.cat(fullResponse, dim=1).reshape(batchSize, *spatialShape)
@@ -78,12 +80,14 @@ def arrayResponseCore(
         if chunkSize is None:
             chunkSize = gridSize
 
+        weightsConj = weights.conj().clone()
+
         fullResponse = []
         for chunk in range(0, gridSize, chunkSize):
             waveVectorChunk = waveVectorFlat[:, chunk : chunk + chunkSize]  # [3, Pc]
             phaseChunk = torch.einsum("bin,ip->bnp", elementLocalPosition, waveVectorChunk)
             arrayManifoldChunk = torch.exp(1j * phaseChunk)
-            chunkResponse = torch.einsum("bn,bnp->bp", weights.conj(), arrayManifoldChunk)
+            chunkResponse = torch.einsum("bn,bnp->bp", weightsConj, arrayManifoldChunk)
             fullResponse.append(chunkResponse)
 
         fullResponse = torch.cat(fullResponse, dim=1).reshape(batchSize, *spatialShape)
