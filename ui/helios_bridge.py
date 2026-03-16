@@ -300,9 +300,7 @@ def compute_pattern_2d(batch: ArrayBatch, sample_id: int = 0, resolution: int = 
     az_zero = torch.zeros(1, device=dev, dtype=dtype)
     el_response = arrayResponseSample(batch, sample_id, az_zero, el_axis).cpu().tolist()
 
-    # Flip elevation axis so that positive elevation corresponds to the nadir-facing
-    # direction (the array boresight), not the anti-nadir (zenith) direction.
-    el_axis_display = -el_axis
+    el_axis_display = el_axis
 
     # 3D surface (coarser grid for performance)
     res3d = min(resolution, 100)
