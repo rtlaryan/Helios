@@ -1,0 +1,42 @@
+[project]
+name = "helios"
+version = "0.1.0"
+description = "RL + DL - based phased array beamforming research framework"
+requires-python = ">=3.12"
+
+# -------------------------
+# Ruff (lint + format)
+# -------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["scripts", "model", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "F",  # pyflakes
+    "I",  # import sorting
+    "B",  # bugbear
+]
+ignore = [
+    "E501",  # line length handled by formatter
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/phasedArray_old.py" = ["ALL"]
+
+
+# -------------------------
+# Optional: pytest config
+# -------------------------
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]

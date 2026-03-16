@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Helios — Beamforming Studio</title>
+  <meta name="description" content="Interactive phased-array beamforming design tool with 3D globe target editor and radiation pattern visualization." />
+  <link rel="stylesheet" href="css/main.css" />
+
+  <!-- Three.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <!-- OrbitControls from CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<div id="app">
+
+  <!-- ── Header ─────────────────────────────────── -->
+  <header id="header">
+    <div class="logo">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="2"/><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+      </svg>
+      HELIOS
+      <span class="logo-badge">BEAMFORMING STUDIO</span>
+    </div>
+
+    <nav class="header-tabs">
+      <button class="htab active" data-view="target" data-sidebar-tab="zone-tab" id="htab-target">Target Designer</button>
+      <button class="htab" data-view="antenna" data-sidebar-tab="antenna-tab" id="htab-antenna">Antenna &amp; Pattern</button>
+      <button class="htab" data-view="array" data-sidebar-tab="" id="htab-array">Array Geometry</button>
+    </nav>
+
+    <div class="header-status">
+      <div class="status-dot" id="server-dot"></div>
+      <span id="server-label">Connecting…</span>
+    </div>
+  </header>
+
+  <!-- ── Globe ──────────────────────────────────── -->
+  <main id="globe-area">
+    <canvas id="globe-canvas"></canvas>
+
+    <!-- Drawing toolbar -->
+    <div id="draw-toolbar">
+      <div class="zone-type-toggle">
+        <button class="zone-type-btn active" data-type="importance">IMP</button>
+        <button class="zone-type-btn" data-type="power">PWR</button>
+      </div>
+
+
+
+      <button class="draw-btn active" id="btn-circle" title="Draw circle zone">
+        <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/></svg>
+        Circle
+      </button>
+
+      <button class="draw-btn" id="btn-polygon" title="Draw polygon zone">
+        <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polygon points="12,3 21,9 18,21 6,21 3,9"/></svg>
+        Polygon
+      </button>
+
+      <div class="toolbar-sep"></div>
+
+      <button class="draw-btn" id="btn-clear-zones" title="Clear all zones" style="color: var(--danger);">
+        <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="3,6 5,6 21,6"/><path d="M19,6l-1,14H6L5,6"/><path d="M10,11v6M14,11v6"/><path d="M9,6V4h6v2"/></svg>
+        Clear
+      </button>
+
+      <div class="toolbar-sep"></div>
+
+      <button class="draw-btn" id="btn-autorotate" title="Toggle Earth auto-rotation">
+        <svg id="autorotate-icon-play" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" style="display:none"><polyline points="5,3 19,12 5,21 5,3"/></svg>
+        <svg id="autorotate-icon-pause" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+        <span id="autorotate-label">Stopped</span>
+      </button>
+    </div>
+
+    <!-- Zone list overlay -->
+    <div id="zone-list-overlay"></div>
+  </main>
+
+  <!-- ── Sidebar ────────────────────────────────── -->
+  <aside id="sidebar">
+    <div class="sidebar-tabs">
+      <button class="stab active" data-tab="zone-tab">ZONES</button>
+      <button class="stab" data-tab="maps-tab">MAPS</button>
+      <button class="stab" data-tab="antenna-tab">ANTENNA</button>
+      <button class="stab" data-tab="pattern-tab">PATTERN</button>
+    </div>
+
+    <div class="sidebar-content">
+
+      <!-- ── ZONES TAB ───────────────── -->
+      <div class="tab-panel active" id="zone-tab">
+
+        <div class="card" id="card-zone-params">
+          <div class="card-header">
+            <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 10c0 7-9 13-9 13S3 17 3 10a9 9 0 1 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
+            ZONE PARAMETERS
+            <span class="fold-icon">
+              <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="6,9 12,15 18,9"/></svg>
+            </span>
+          </div>
+          <div class="card-body">
+
+            <div class="slider-group">
+              <label>Peak Power (dB)</label>
+              <div class="slider-row">
+                <input type="range" id="zone-db" min="-30" max="30" step="1" value="0" />
+                <span class="slider-val" id="zone-db-val">0 dB</span>
+              </div>
+            </div>
+
+            <div class="slider-group">
+              <label>Rolloff σ (°)</label>
+              <div class="slider-row">
+                <input type="range" id="zone-rolloff" min="0.1" max="10" step="0.1" value="1.0" />
+                <span class="slider-val" id="zone-rolloff-val">1.0°</span>
+              </div>
+            </div>
+
+            <div class="slider-group">
+              <label>Zone Radius (°)</label>
+              <div class="slider-row">
+                <input type="range" id="zone-radius" min="1" max="30" step="0.5" value="8" />
+                <span class="slider-val" id="zone-radius-val">8°</span>
+              </div>
+            </div>
+
+            <p class="hint" id="poly-hint" style="display:none;color:var(--accent);">Shift+Click to add polygon vertices &middot; right-click or double-click to finish</p>
+            <p class="hint" id="draw-hint">Hold <kbd>Shift</kbd> + Click on the globe to draw a zone.</p>
+
+            <div style="margin-top:10px;">
+              <label style="font-size:10.5px;color:var(--text-dim);letter-spacing:.05em;">BEAM PROFILE PREVIEW</label>
+              <canvas id="rolloff-preview" style="width:100%;height:72px;border-radius:6px;background:var(--bg-input);display:block;margin-top:4px;"></canvas>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" id="card-zone-list">
+          <div class="card-header">
+            <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+            DEFINED ZONES
+            <span id="zone-count-badge" style="margin-left:auto;font-size:10px;color:var(--text-dim);">0 zones</span>
+          </div>
+          <div class="card-body" id="zone-list-body" style="max-height:180px;overflow-y:auto;padding-right:4px;">
+            <p class="hint" id="zone-empty-hint">No zones defined yet.</p>
+          </div>
+        </div>
+        
+        <!-- Focus Region card -->
+        <div class="card">
+          <div class="card-header" id="focus-header" style="cursor:pointer;">
+            <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M3 12h2M19 12h2M12 3v2M12 19v2"/><circle cx="12" cy="12" r="9" opacity=".3"/></svg>
+            FOCUS REGION
+            <label id="focus-enable-label" style="margin-left:auto;display:flex;align-items:center;gap:6px;font-size:11px;font-weight:400;cursor:pointer;">
+              <input type="checkbox" id="focus-enabled" style="cursor:pointer;" />
+              Enable
+            </label>
+          </div>
+          <div class="card-body" id="focus-body" style="display:none;">
+            <p class="hint">Constrain maps to a sub-region for higher effective resolution.</p>
+            <div class="field-row">
+              <div class="field">
+                <label>Lat min (°)</label>
+                <input type="number" id="focus-lat-min" value="-60" min="-90" max="90" step="1" />
+              </div>
+              <div class="field">
+                <label>Lat max (°)</label>
+                <input type="number" id="focus-lat-max" value="60" min="-90" max="90" step="1" />
+              </div>
+            </div>
+            <div class="field-row">
+              <div class="field">
+                <label>Lon min (°)</label>
+                <input type="number" id="focus-lon-min" value="-180" min="-180" max="180" step="1" />
+              </div>
+              <div class="field">
+                <label>Lon max (°)</label>
+                <input type="number" id="focus-lon-max" value="180" min="-180" max="180" step="1" />
+              </div>
+            </div>
+            <button class="btn btn-secondary btn-full" id="btn-focus-from-zones" style="margin-top:6px;font-size:11px;">
+              Auto-fit to drawn zones
+            </button>
+          </div>
+        </div>
+
+        <div style="margin-top:auto"></div>
+        <button class="btn btn-primary btn-full btn-generate" id="btn-generate-maps">
+          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="22,12 18,12 15,21 9,3 6,12 2,12"/></svg>
+          Generate Maps
+        </button>
+
+        <button class="btn btn-secondary btn-full btn-export" id="btn-export-target">
+          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7,10 12,15 17,10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Export TargetSpec (.pt)
+        </button>
+      </div>
+
+      <!-- ── MAPS TAB ────────────────── -->
+      <div class="tab-panel" id="maps-tab">
+        <div class="card">
+          <div class="card-header">
+            <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M3 15h18M9 3v18M15 3v18"/></svg>
+            MAP SETTINGS
+          </div>
+          <div class="card-body">
+            <div class="field">
+              <label>Resolution</label>
+              <select id="map-resolution">
+                <option value="1.0">1.0° (fast)</option>
+                <option value="0.5" selected>0.5° (default)</option>
+                <option value="0.25">0.25° (high quality)</option>
+                <option value="0.1">0.1° (ultra)</option>
+                <option value="0.05">0.05° (extreme)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>Globe Overlay</label>
+              <select id="map-display-mode">
+                <option value="none">None</option>
+                <option value="power" selected>Power Map</option>
+                <option value="importance">Importance Map</option>
+                <option value="both">Both (split)</option>
+              </select>
+            </div>
+            <div class="slider-group">
+              <label>Overlay Opacity</label>
+              <div class="slider-row">
+                <input type="range" id="overlay-opacity" min="0" max="1" step="0.05" value="0.75" />
+                <span class="slider-val" id="overlay-opacity-val">75%</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" id="card-power-preview">
+          <div class="card-header">
+            <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polygon points="13,2 3,14 12,14 11,22 21,10 12,10"/></svg>
+            POWER MAP PREVIEW
+          </div>
+          <div class="card-body">
+            <div class="mini-canvas-wrap" style="height:110px;">
+              <canvas id="power-preview-canvas"></canvas>
+              <span class="mini-canvas-label">Power (dB)</span>
+            </div>
+            <div class="colorbar">
+              <span id="power-min-label">−60</span>
+              <div class="colorbar-gradient" style="background: linear-gradient(90deg, #04080f, #0a4fd4, #2196f3, #f0f, #ff0)"></div>
+              <span id="power-max-label">0 dB</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" id="card-importance-preview">
+          <div class="card-header">
+            <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+            IMPORTANCE MAP PREVIEW
+          </div>
+          <div class="card-body">
+            <div class="mini-canvas-wrap" style="height:110px;">
+              <canvas id="importance-preview-canvas"></canvas>
+              <span class="mini-canvas-label">Importance [0–1]</span>
+            </div>
+            <div class="colorbar">
+              <span>0.0</span>
+              <div class="colorbar-gradient" style="background: linear-gradient(90deg, #070b14, #3b1fa8, #a78bfa)"></div>
+              <span>1.0</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="stat-grid" id="map-stats">
+          <div class="stat-item">
+            <span class="stat-label">PEAK POWER</span>
+            <span class="stat-value" id="stat-peak-power">—</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">COVERAGE</span>
+            <span class="stat-value" id="stat-coverage">—</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">ZONES</span>
+            <span class="stat-value" id="stat-zones">0</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">GRID SIZE</span>
+            <span class="stat-value" id="stat-grid-size">—</span>
+          </div>
+        </div>
+
+        <div style="margin-top:auto"></div>
+        <button class="btn btn-primary btn-full btn-generate" id="btn-generate-maps-2" style="margin-top: 12px;">
+          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="22,12 18,12 15,21 9,3 6,12 2,12"/></svg>
+          Generate Maps
+        </button>
+
+        <button class="btn btn-secondary btn-full btn-export" id="btn-export-target-2" style="margin-top: 10px;">
+          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7,10 12,15 17,10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Export TargetSpec (.pt)
+        </button>
+
+        <!-- Manual TargetSpec import -->
+        <div style="margin-top:8px;">
+          <label style="font-size:10.5px;color:var(--text-dim);letter-spacing:.05em;display:block;margin-bottom:4px;">OR IMPORT TARGETSPEC .PT</label>
+          <div style="display:flex;gap:6px;align-items:center;">
+            <input type="file" id="target-import-file" accept=".pt" style="
+              flex:1;font-size:11px;padding:5px 8px;
+              background:var(--bg-input);border:1px solid var(--border);
+              border-radius:6px;color:var(--text-primary);cursor:pointer;
+            "/>
+            <button class="btn btn-secondary" id="btn-import-target" style="white-space:nowrap;padding:6px 10px;font-size:11px;">
+              Import
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── ANTENNA TAB ─────────────── -->
+      <div class="tab-panel" id="antenna-tab">
+        <div class="card">
+          <div class="card-header">
+            <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12" y2="20" stroke-linecap="round" stroke-width="3"/></svg>
+            ORBITAL POSITION
+          </div>
+          <div class="card-body">
+            <div class="field-row">
+              <div class="field">
+                <label>Latitude (°)</label>
+                <input type="number" id="ant-lat" value="0" min="-90" max="90" step="0.1" />
+              </div>
+              <div class="field">
+                <label>Longitude (°)</label>
+                <input type="number" id="ant-lon" value="-83" min="-180" max="180" step="0.1" />
+              </div>
+            </div>
+            <div class="field">
+              <label>Altitude (km)</label>
+              <input type="number" id="ant-alt" value="35786" min="400" max="42000" step="100" />
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="2"/><line x1="8" y1="2" x2="8" y2="22"/><line x1="16" y1="2" x2="16" y2="22"/><line x1="2" y1="8" x2="22" y2="8"/><line x1="2" y1="16" x2="22" y2="16"/></svg>
+            ARRAY CONFIGURATION
+          </div>
+          <div class="card-body">
+            <div class="field-row">
+              <div class="field">
+                <label>Elements</label>
+                <select id="ant-elements">
+                  <option value="16">16</option>
+                  <option value="64" selected>64</option>
+                  <option value="144">144</option>
+                  <option value="256">256</option>
+                  <option value="400">400</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>Geometry</label>
+                <select id="ant-geometry">
+                  <option value="URA" selected>URA</option>
+                  <option value="UCA">UCA</option>
+                </select>
+              </div>
+            </div>
+            <div class="field-row">
+              <div class="field">
+                <label>Frequency (GHz)</label>
+                <input type="number" id="ant-freq" value="30" min="1" max="100" step="0.5" />
+              </div>
+              <div class="field">
+                <label>Spacing (λ)</label>
+                <input type="number" id="ant-spacing" value="0.5" min="0.1" max="2" step="0.05" />
+              </div>
+            </div>
+            <div class="field">
+              <label>Aspect Ratio</label>
+              <select id="ant-aspect">
+                <option value="1" selected>1:1 (Square)</option>
+                <option value="0.5">1:2</option>
+                <option value="0.25">1:4</option>
+                <option value="2">2:1</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <button class="btn btn-primary btn-full" id="btn-load-antenna">
+          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 1 0 0 14.14"/><path d="M22 2l-5 5M22 2l-5 5M22 7l-5-5"/></svg>
+          Load Antenna
+        </button>
+
+        <!-- Manual batch import -->
+        <div style="margin-top:8px;">
+          <label style="font-size:10.5px;color:var(--text-dim);letter-spacing:.05em;display:block;margin-bottom:4px;">OR IMPORT ARRAY BATCH JSON</label>
+          <div style="display:flex;gap:6px;align-items:center;">
+            <input type="file" id="batch-import-file" accept=".json" style="
+              flex:1;font-size:11px;padding:5px 8px;
+              background:var(--bg-input);border:1px solid var(--border);
+              border-radius:6px;color:var(--text-primary);cursor:pointer;
+            "/>
+            <button class="btn btn-secondary" id="btn-import-batch" style="white-space:nowrap;padding:6px 10px;font-size:11px;">
+              Import
+            </button>
+          </div>
+          <p class="hint" style="margin-top:4px;">JSON must have: <code>positions_m</code>, <code>weights_real</code>, <code>wavelength_m</code>, <code>lat</code>, <code>lon</code>, <code>alt</code></p>
+        </div>
+
+        <div class="stat-grid" id="antenna-stats" style="display:none;">
+          <div class="stat-item">
+            <span class="stat-label">ELEMENTS</span>
+            <span class="stat-value" id="stat-ant-elements">—</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">WAVELENGTH</span>
+            <span class="stat-value" id="stat-ant-wl">—</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">ALTITUDE</span>
+            <span class="stat-value" id="stat-ant-alt">—</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">FREQ</span>
+            <span class="stat-value" id="stat-ant-freq">—</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── PATTERN TAB ─────────────── -->
+      <div class="tab-panel" id="pattern-tab">
+        <div class="card">
+          <div class="card-header">
+            <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="22,12 18,12 15,21 9,3 6,12 2,12"/></svg>
+            PATTERN SETTINGS
+          </div>
+          <div class="card-body">
+            <div class="field-row">
+              <div class="field">
+                <label>Resolution</label>
+                <select id="pattern-resolution">
+                  <option value="80">Low (fast)</option>
+                  <option value="150" selected>Medium</option>
+                  <option value="250">High</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>Ground Overlay</label>
+                <select id="pattern-overlay">
+                  <option value="none">None</option>
+                  <option value="show" selected>Show on Globe</option>
+                </select>
+              </div>
+            </div>
+            <div class="slider-group">
+              <label>Elevation Cut (°)</label>
+              <div class="slider-row">
+                <input type="range" id="pat-el-cut" min="-90" max="90" step="1" value="0" />
+                <span class="slider-val" id="pat-el-cut-val">0°</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <button class="btn btn-primary btn-full" id="btn-compute-pattern">
+          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polygon points="5,3 19,12 5,21 5,3"/></svg>
+          Compute Pattern
+        </button>
+
+        <div class="progress-bar-wrap" id="pattern-progress" style="display:none;">
+          <div class="progress-bar" style="width:0%" id="pattern-progress-bar"></div>
+        </div>
+
+        <div class="card" id="card-az-cut" style="display:none;">
+          <div class="card-header">
+            <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 18 0 9 9 0 0 0-18 0"/><line x1="3" y1="12" x2="21" y2="12"/></svg>
+            AZIMUTH CUT
+          </div>
+          <div class="card-body" style="padding:8px;">
+            <canvas class="chart-canvas" id="az-chart"></canvas>
+          </div>
+        </div>
+
+        <div class="card" id="card-el-cut" style="display:none;">
+          <div class="card-header">
+            <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 3v18M3 12h18" stroke-width="2"/></svg>
+            ELEVATION CUT
+          </div>
+          <div class="card-body" style="padding:8px;">
+            <canvas class="chart-canvas" id="el-chart"></canvas>
+          </div>
+        </div>
+
+        <div class="card" id="card-3d-pattern" style="display:none;">
+          <div class="card-header">
+            <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+            3D RADIATION PATTERN
+          </div>
+          <div class="card-body" style="padding:4px;">
+            <canvas id="array-geo-canvas"></canvas>
+          </div>
+        </div>
+
+        <!-- Array geometry sub-section in pattern tab -->
+        <div class="card" id="card-array-geo" style="display:none;">
+          <div class="card-header">
+            <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="5" r="3"/><circle cx="5" cy="19" r="3"/><circle cx="19" cy="19" r="3"/><line x1="12" y1="8" x2="5" y2="16"/><line x1="12" y1="8" x2="19" y2="16"/></svg>
+            ARRAY GEOMETRY &amp; WEIGHTS
+          </div>
+          <div class="card-body" style="padding:4px;">
+            <canvas id="geo-canvas-small" height="180" style="width:100%;height:180px;display:block;"></canvas>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /sidebar-content -->
+  </aside>
+</div><!-- /app -->
+
+<!-- Toast container -->
+<div id="toast-container"></div>
+
+<!-- Scripts (module order matters) -->
+<script src="js/state.js"></script>
+<script src="js/api.js"></script>
+<script src="js/globe.js"></script>
+<script src="js/targetEditor.js"></script>
+<script src="js/mapRenderer.js"></script>
+<script src="js/antennaPanel.js"></script>
+<script src="js/patternPanel.js"></script>
+<script src="js/arrayGeoPanel.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
