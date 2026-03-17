@@ -393,7 +393,7 @@ def compute_ground_projection(
     # Flat index k → lat_t[k//W], lon_t[k%W], so natural reshape is [H, W].
     # Flip rows so row 0 = lat +90° (north), matching equirectangular UV
     # (Three.js sphere: row 0 of texture = top = north pole).
-    db_map = response.reshape(H, W).flip(dims=[0]).cpu().tolist()
+    db_map = response.reshape(H, W).cpu().tolist()
 
     return {
         "lat_vec": lat_vec.tolist(),
