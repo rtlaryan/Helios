@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 import torch
+from train.evolve import EvolutionConfig
 
 
 @dataclass
@@ -48,3 +49,99 @@ class ArrayBatch:
         if self.elementMask is not None:
             w = w * self.elementMask.to(w.dtype)
         return w
+
+    def fetch(self, i: int | slice | torch.Tensor = 1) -> "ArrayBatch":
+        if isinstance(i, int):
+            i = slice(i, i + 1)
+
+        elementMask = None if self.elementMask is None else self.elementMask[i]
+
+        return ArrayBatch(
+            elementLocalPosition=self.elementLocalPosition[i],
+            weights=self.weights[i],
+            wavelength=self.wavelength,
+            gain=self.gain[i],
+            LLAPosition=self.LLAPosition[i],
+            ECEFPosition=self.ECEFPosition[i],
+            elementMask=elementMask,
+        )
+
+    def mutateWeights(self, config: EvolutionConfig, step: int) -> "ArrayBatch":
+        phase = self.weights.angle()
+        amplitude = self.weights.abs()
+        phaseSigma, amplitudeSigma = config.sigmaAt(step)
+        phaseNoise = torch.randn_like(phase, generator=config.generator) * phaseSigma
+        amplitudeNoise = torch.randn_like(amplitude, generator=config.generator) * amplitudeSigma
+
+        mutatedPhase = phase + phaseNoise
+        mutatedPhase = torch.remainder(mutatedPhase + torch.pi, 2 * torch.pi) - torch.pi
+
+        mutatedAmplitude = amplitude * (1.0 + amplitudeNoise)
+        mutatedAmplitude = mutatedAmplitude.clamp_min(0.0)
+        mutatedAmplitude = mutatedAmplitude / mutatedAmplitude.norm(dim=1, keepdim=True)
+
+        weights = mutatedAmplitude * torch.exp(1j * mutatedPhase)
+
+        return ArrayBatch(
+            elementLocalPosition=self.elementLocalPosition,
+            weights=weights,
+            wavelength=self.wavelength,
+            gain=self.gain,
+            LLAPosition=self.LLAPosition,
+            ECEFPosition=self.ECEFPosition,
+            elementMask=self.elementMask,
+        )
+
+    def serializeBatch(self) -> dict:
+        return {
+            "elementLocalPosition": self.elementLocalPosition.detach().cpu(),
+            "weights": self.weights.detach().cpu(),
+            "wavelength": self.wavelength,
+            "gain": self.gain.detach().cpu(),
+            "LLAPosition": self.LLAPosition.detach().cpu(),
+            "ECEFPosition": self.ECEFPosition.detach().cpu(),
+            "elementMask": None if self.elementMask is None else self.elementMask.detach().cpu(),
+        }
+
+    def serializeBatchSample(self, idx: int) -> dict:
+        return {
+            "elementLocalPosition": self.elementLocalPosition[idx].detach().cpu(),
+            "weights": self.weights[idx].detach().cpu(),
+            "wavelength": self.wavelength,
+            "gain": self.gain[idx].detach().cpu(),
+            "LLAPosition": self.LLAPosition[idx].detach().cpu(),
+            "ECEFPosition": self.ECEFPosition[idx].detach().cpu(),
+            "elementMask": None
+            if self.elementMask is None
+            else self.elementMask[idx].detach().cpu(),
+        }
+
+
+def merge(batches: list[ArrayBatch]) -> "ArrayBatch":
+    referenceBatch = batches[0]
+
+    def concatenateTensors(attr):
+        tensors = [getattr(batch, attr) for batch in batches if getattr(batch, attr) is not None]
+        return torch.cat(tensors, dim=0)
+
+    for batch in batches:
+        assert batch.device == referenceBatch.device
+        assert batch.dtype == referenceBatch.dtype
+        assert batch.N == referenceBatch.N
+        assert batch.wavelength == referenceBatch.wavelength
+        assert type(batch.elementMask) is type(referenceBatch.N)
+
+    if referenceBatch.elementMask is None:
+        elementMasks = None
+    else:
+        elementMasks = concatenateTensors("elementMask")
+
+    return ArrayBatch(
+        elementLocalPosition=concatenateTensors("elementLocalPosition"),
+        weights=concatenateTensors("weights"),
+        wavelength=referenceBatch.wavelength,
+        gain=concatenateTensors("gain"),
+        LLAPosition=concatenateTensors("LLAPosition"),
+        ECEFPosition=concatenateTensors("ECEFPosition"),
+        elementMask=elementMasks,
+    )

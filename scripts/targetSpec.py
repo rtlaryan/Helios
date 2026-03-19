@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 
 
 @dataclass(frozen=True)
@@ -46,3 +47,68 @@ class TargetSpec:
         self.powerMap = self.powerMap.to(device=device, dtype=dtype)
         self.hotspotCoordinates = self.hotspotCoordinates.to(device=device, dtype=dtype)
         return self
+
+    def decimate(self, decimationFactor: int = 4) -> TargetSpec:
+        height, width = self.searchLatitudes.shape
+        outHeight = max(1, (height + decimationFactor - 1) // decimationFactor)
+        outWidth = max(1, (width + decimationFactor - 1) // decimationFactor)
+
+        # Average Pooling
+        decimatedLatitudes = (
+            F.adaptive_avg_pool2d(
+                self.searchLatitudes.unsqueeze(0).unsqueeze(0), (outHeight, outWidth)
+            )
+            .squeeze(0)
+            .squeeze(0)
+        )
+        decimatedLongtitudes = (
+            F.adaptive_avg_pool2d(
+                self.searchLongitudes.unsqueeze(0).unsqueeze(0), (outHeight, outWidth)
+            )
+            .squeeze(0)
+            .squeeze(0)
+        )
+
+        # max pooling
+        decimatedImportance = (
+            F.adaptive_max_pool2d(
+                self.importanceMap.unsqueeze(0).unsqueeze(0), (outHeight, outWidth)
+            )
+            .squeeze(0)
+            .squeeze(0)
+        )
+
+        # importance weighted pooling
+        weightedPower = self.powerMap * self.importanceMap
+        averagePower = (
+            F.adaptive_avg_pool2d(weightedPower.unsqueeze(0).unsqueeze(0), (outHeight, outWidth))
+            .squeeze(0)
+            .squeeze(0)
+        )
+        averageImportance = (
+            F.adaptive_avg_pool2d(
+                self.importanceMap.unsqueeze(0).unsqueeze(0), (outHeight, outWidth)
+            )
+            .squeeze(0)
+            .squeeze(0)
+        )
+        decimatedPower = averagePower / averageImportance
+
+        return TargetSpec(
+            decimatedLatitudes,
+            decimatedLongtitudes,
+            decimatedImportance,
+            decimatedPower,
+            self.hotspotCoordinates.clone(),
+            self.thresholdDB,
+        )
+
+    def serializeTargetSpec(self) -> dict:
+        return {
+            "searchLatitudes": self.searchLatitudes.detach().cpu(),
+            "searchLongitudes": self.searchLongitudes.detach().cpu(),
+            "importanceMap": self.importanceMap.detach().cpu(),
+            "powerMap": self.powerMap.detach().cpu(),
+            "hotspotCoordinates": self.hotspotCoordinates.detach().cpu(),
+            "thresholdDB": self.thresholdDB,
+        }

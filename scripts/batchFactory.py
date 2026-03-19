@@ -5,7 +5,7 @@ import torch
 
 from .arrayBatch import ArrayBatch
 from .arraySpec import ArraySpec
-from .coordinateTransforms import LLAtoECEF
+from .coordinateTransforms import LLAtoECEF, getECEFtoENUMapping
 
 
 def sampleElementPositions(
@@ -144,8 +144,6 @@ def sampleDirectedWeights(
         zeros = torch.zeros_like(targetLLA[..., :1])
         targetLLA = torch.cat([targetLLA, zeros], dim=-1)
 
-    from .coordinateTransforms import LLAtoECEF, getECEFtoENUMapping
-
     targetECEF = LLAtoECEF(targetLLA)
     arrayECEF = LLAtoECEF(arrayLLA)
     directionECEF = targetECEF - arrayECEF
@@ -163,16 +161,10 @@ def sampleDirectedWeights(
     directionLocal = torch.stack([x, y, z], dim=-1)
     directionLocal = directionLocal / directionLocal.norm(dim=-1, keepdim=True).clamp_min(1e-12)
 
-    if torch.any(directionLocal[..., 0] <= 0):
-        # Allow target direction towards the sky for now for debugging if necessary
-        # raise ValueError("Target direction is not in the Earth-facing (+x/down) hemisphere.")
-        pass
-
-    # The directionLocal vector points FROM the array TO the target.
-    # We want the weights to focus the beam in this direction.
     waveVector = (2 * torch.pi / spec.wavelength) * directionLocal
 
     phase = torch.einsum("bi,bin->bn", waveVector, localPositions)
+
     if spec.phaseJitterSTD > 0:
         phase = phase + spec.phaseJitterSTD * torch.randn_like(phase)
 

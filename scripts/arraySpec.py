@@ -38,3 +38,22 @@ class ArraySpec:
     @property
     def elementSpacing(self) -> float:
         return self.wavelength * self.elementSpacingRatio
+
+    def serializeArraySpec(self) -> dict:
+        return {
+            "centerFrequency": self.centerFrequency,
+            "elementSpacingRatio": self.elementSpacingRatio,
+            "positionJitterSTD": self.positionJitterSTD,
+            "phaseJitterSTD": self.phaseJitterSTD,
+            "failRate": self.failRate,
+            "allowedElementCount": tuple(self.allowedElementCount),
+            "allowedAspectRatio": tuple(self.allowedAspectRatio),
+            "geometry": self.geometry,
+            "gainRange": tuple(self.gainRange),
+            "sparsityRange": tuple(self.sparsityRange),
+            "latitudeRange": tuple(self.latitudeRange),
+            "longitudeRange": tuple(self.longitudeRange),
+            "altitudeRange": tuple(self.altitudeRange),
+            "wavelength": self.wavelength,
+            "elementSpacing": self.elementSpacing,
+        }
