@@ -148,33 +148,53 @@ const TargetEditor = (() => {
             const colorHex = '#' + z.color.toString(16).padStart(6, '0');
             const isImp    = z.type === 'importance';
             const isPoly   = z.shape === 'polygon';
-            const metaStr  = isImp ? `σ=${z.rolloff}°` : `${z.peak_db}dB · σ=${z.rolloff}°`;
-            const shapeStr = isPoly ? ` · ${z.verts.length}pts` : ` r=${z.radius_deg?.toFixed(1)}°`;
+            const shapeStr = isPoly ? `${z.verts.length} pts` : `r=${z.radius_deg?.toFixed(1)}°`;
+            const peakStr  = isImp ? '' : ` · ${z.peak_db}dB`;
 
             // Sidebar row
             const row = document.createElement('div');
             row.style.cssText = `
-                display:flex; align-items:center; gap:8px; padding:6px 8px;
-                background:var(--bg-input); border-radius:6px; margin-bottom:6px;
+                padding:6px 8px; background:var(--bg-input);
+                border-radius:6px; margin-bottom:6px;
             `;
             row.innerHTML = `
-                <span style="width:10px;height:10px;border-radius:${isPoly ? '2px' : '50%'};background:${colorHex};flex-shrink:0;"></span>
-                <span style="flex:1;font-size:12px;color:var(--text-primary);font-weight:500;">
-                    ${isImp ? 'Imp' : 'Pwr'} ${isPoly ? 'Poly' : 'Zone'} ${i + 1}
-                </span>
-                <span style="font-size:10.5px;font-family:var(--font-mono);color:var(--text-dim);">
-                    ${metaStr}${shapeStr}
-                </span>
-                <button data-id="${z.id}" style="
-                    width:18px;height:18px;border:none;background:none;cursor:pointer;
-                    color:var(--text-dim);font-size:14px;display:flex;align-items:center;justify-content:center;
-                    border-radius:50%;
-                " title="Remove zone">×</button>
+                <div style="display:flex;align-items:center;gap:8px;">
+                    <span style="width:10px;height:10px;border-radius:${isPoly ? '2px' : '50%'};background:${colorHex};flex-shrink:0;"></span>
+                    <span style="flex:1;font-size:12px;color:var(--text-primary);font-weight:500;">
+                        ${isImp ? 'Imp' : 'Pwr'} ${isPoly ? 'Poly' : 'Zone'} ${i + 1}
+                    </span>
+                    <span style="font-size:10.5px;font-family:var(--font-mono);color:var(--text-dim);">
+                        ${shapeStr}${peakStr}
+                    </span>
+                    <button data-id="${z.id}" style="
+                        width:18px;height:18px;border:none;background:none;cursor:pointer;
+                        color:var(--text-dim);font-size:14px;display:flex;align-items:center;justify-content:center;
+                        border-radius:50%;
+                    " title="Remove zone">×</button>
+                </div>
+                <div style="display:flex;align-items:center;gap:6px;margin-top:5px;padding-left:18px;">
+                    <label style="font-size:10px;color:var(--text-dim);white-space:nowrap;min-width:38px;">σ rolloff</label>
+                    <input type="range" data-zone-id="${z.id}" class="zone-rolloff-slider"
+                        min="0.1" max="10" step="0.1" value="${z.rolloff}"
+                        style="flex:1;height:3px;accent-color:${colorHex};" />
+                    <span class="zone-rolloff-val" style="font-size:10px;font-family:var(--font-mono);color:var(--accent);min-width:30px;text-align:right;">${parseFloat(z.rolloff).toFixed(1)}°</span>
+                </div>
             `;
             row.querySelector('button').addEventListener('click', () => deleteZone(z.id));
+
+            // Live rolloff update
+            const slider = row.querySelector('.zone-rolloff-slider');
+            const valSpan = row.querySelector('.zone-rolloff-val');
+            slider.addEventListener('input', () => {
+                const newRolloff = parseFloat(slider.value);
+                valSpan.textContent = newRolloff.toFixed(1) + '°';
+                const zone = HeliosState.zones.find(zz => zz.id === z.id);
+                if (zone) zone.rolloff = newRolloff;
+            });
+
             body.appendChild(row);
 
-            // Globe overlay chip — only show lat/lon for circle zones
+            // Globe overlay chip
             const chip = document.createElement('div');
             chip.className = 'zone-chip';
             chip.innerHTML = `

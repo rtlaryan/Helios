@@ -28,6 +28,7 @@ const GlobeRenderer = (() => {
     let groundProjectionMesh = null;
     const zoneMeshes = {}; // id → mesh
     let _autoRotate = false;
+    let _focusRegionLines = null;
 
     // ── Lat/Lon ↔ XYZ ─────────────────────────────────────────────────────────
     function latLonToXYZ(lat, lon, r = EARTH_R) {
@@ -308,6 +309,82 @@ const GlobeRenderer = (() => {
         if (line) earthMesh.remove(line);
     }
 
+    // ── Focus region rectangle ─────────────────────────────────────────────────
+    /**
+     * Draw a dotted lat/lon bounding box on the globe surface.
+     * Lines follow lat/lon grid lines (not great circles).
+     */
+    function updateFocusRegion(latMin, latMax, lonMin, lonMax) {
+        clearFocusRegion();
+        const R = EARTH_R * 1.009; // slightly above zone meshes
+        const STEPS = 120;
+        const pts = [];
+
+        // Build a closed rectangle path: bottom edge → right edge → top edge → left edge
+        const segments = [
+            // bottom (latMin, lon from lonMin→lonMax)
+            Array.from({length: STEPS + 1}, (_, i) => [latMin, lonMin + (lonMax - lonMin) * i / STEPS]),
+            // right (lonMax, lat from latMin→latMax)
+            Array.from({length: STEPS + 1}, (_, i) => [latMin + (latMax - latMin) * i / STEPS, lonMax]),
+            // top (latMax, lon from lonMax→lonMin)
+            Array.from({length: STEPS + 1}, (_, i) => [latMax, lonMax - (lonMax - lonMin) * i / STEPS]),
+            // left (lonMin, lat from latMax→latMin)
+            Array.from({length: STEPS + 1}, (_, i) => [latMax - (latMax - latMin) * i / STEPS, lonMin]),
+        ];
+
+        // Render each side as a separate dashed line (alternating visible segments)
+        const DASH_DEG = 4; // approximate dash length in degrees of arc
+        const group = new THREE.Group();
+
+        for (const seg of segments) {
+            // Split each side into alternating dash/gap segments
+            let drawing = true;
+            let dashBuf = [];
+            let arcSoFar = 0;
+
+            for (let k = 0; k < seg.length - 1; k++) {
+                const [lat0, lon0] = seg[k];
+                const [lat1, lon1] = seg[k + 1];
+                const dlat = lat1 - lat0, dlon = lon1 - lon0;
+                const segLen = Math.sqrt(dlat * dlat + dlon * dlon);
+                arcSoFar += segLen;
+
+                if (drawing) dashBuf.push(latLonToXYZ(lat0, lon0, R));
+
+                if (arcSoFar >= DASH_DEG) {
+                    if (drawing && dashBuf.length > 1) {
+                        dashBuf.push(latLonToXYZ(lat1, lon1, R));
+                        const line = new THREE.Line(
+                            new THREE.BufferGeometry().setFromPoints(dashBuf),
+                            new THREE.LineBasicMaterial({ color: 0xffffff, opacity: 0.75, transparent: true })
+                        );
+                        line.renderOrder = 4;
+                        group.add(line);
+                    }
+                    dashBuf = [];
+                    arcSoFar = 0;
+                    drawing = !drawing;
+                }
+            }
+            // flush remaining dash
+            if (drawing && dashBuf.length > 1) {
+                const line = new THREE.Line(
+                    new THREE.BufferGeometry().setFromPoints(dashBuf),
+                    new THREE.LineBasicMaterial({ color: 0xffffff, opacity: 0.75, transparent: true })
+                );
+                line.renderOrder = 4;
+                group.add(line);
+            }
+        }
+
+        _focusRegionLines = group;
+        earthMesh.add(group);
+    }
+
+    function clearFocusRegion() {
+        if (_focusRegionLines) { earthMesh.remove(_focusRegionLines); _focusRegionLines = null; }
+    }
+
     // ── Antenna marker ─────────────────────────────────────────────────────────
     function setAntennaPosition(lat, lon, altKm) {
         if (antennaMesh) scene.remove(antennaMesh);
@@ -405,14 +482,26 @@ const GlobeRenderer = (() => {
         if (overlayMeshImportance) { earthMesh.remove(overlayMeshImportance); overlayMeshImportance = null; }
         if (!maps || mode === 'none') return;
 
-        const powerColor = (db) => {
-            const t = Math.max(0, Math.min(1, (db + 60) / 60));
-            if (t < 0.05) return [0, 0, 0, 0];
-            const r = Math.round(t < 0.5 ? 0 : (t - 0.5) * 2 * 255);
-            const g = Math.round(t < 0.5 ? t * 2 * 200 : 200 - (t - 0.5) * 2 * 100);
-            const b = Math.round(t < 0.3 ? 200 : Math.max(0, 200 - (t - 0.3) / 0.7 * 200));
-            return [r, g, b, Math.round(t * 200)];
-        };
+        const isLinear = maps.power_normalized;
+        const powerColor = isLinear
+            ? (v) => {
+                // Linear [0,1] — map directly
+                if (v < 0.01) return [0, 0, 0, 0];
+                const t = Math.max(0, Math.min(1, v));
+                const r = Math.round(t < 0.5 ? 0 : (t - 0.5) * 2 * 255);
+                const g = Math.round(t < 0.5 ? t * 2 * 200 : 200 - (t - 0.5) * 2 * 100);
+                const b = Math.round(t < 0.3 ? 200 : Math.max(0, 200 - (t - 0.3) / 0.7 * 200));
+                return [r, g, b, Math.round(t * 200)];
+            }
+            : (db) => {
+                // dB scale [-60, 0]
+                const t = Math.max(0, Math.min(1, (db + 60) / 60));
+                if (t < 0.05) return [0, 0, 0, 0];
+                const r = Math.round(t < 0.5 ? 0 : (t - 0.5) * 2 * 255);
+                const g = Math.round(t < 0.5 ? t * 2 * 200 : 200 - (t - 0.5) * 2 * 100);
+                const b = Math.round(t < 0.3 ? 200 : Math.max(0, 200 - (t - 0.3) / 0.7 * 200));
+                return [r, g, b, Math.round(t * 200)];
+            };
 
         const impColor = (v) => {
             if (v < 0.02) return [0, 0, 0, 0];
@@ -463,5 +552,6 @@ const GlobeRenderer = (() => {
         addZoneMesh, removeZoneMesh, addPolygonZoneMesh,
         addPolyPreviewLine, removePolyPreview,
         setAntennaPosition, updateGroundProjection, updateMapOverlay, rayCastLatLon,
+        updateFocusRegion, clearFocusRegion,
     };
 })();

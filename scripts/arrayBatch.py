@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 
 import torch
-from train.evolve import EvolutionConfig
 
 
 @dataclass
@@ -66,12 +65,14 @@ class ArrayBatch:
             elementMask=elementMask,
         )
 
-    def mutateWeights(self, config: EvolutionConfig, step: int) -> "ArrayBatch":
+    def mutateWeights(
+        self, phaseSigma: float, amplitudeSigma: float, generator: torch.Generator | None = None
+    ) -> "ArrayBatch":
         phase = self.weights.angle()
         amplitude = self.weights.abs()
-        phaseSigma, amplitudeSigma = config.sigmaAt(step)
-        phaseNoise = torch.randn_like(phase, generator=config.generator) * phaseSigma
-        amplitudeNoise = torch.randn_like(amplitude, generator=config.generator) * amplitudeSigma
+
+        phaseNoise = torch.randn_like(phase, generator=generator) * phaseSigma
+        amplitudeNoise = torch.randn_like(amplitude, generator=generator) * amplitudeSigma
 
         mutatedPhase = phase + phaseNoise
         mutatedPhase = torch.remainder(mutatedPhase + torch.pi, 2 * torch.pi) - torch.pi
@@ -129,7 +130,7 @@ def merge(batches: list[ArrayBatch]) -> "ArrayBatch":
         assert batch.dtype == referenceBatch.dtype
         assert batch.N == referenceBatch.N
         assert batch.wavelength == referenceBatch.wavelength
-        assert type(batch.elementMask) is type(referenceBatch.N)
+        assert type(batch.elementMask) is type(referenceBatch.elementMask)
 
     if referenceBatch.elementMask is None:
         elementMasks = None

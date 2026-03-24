@@ -218,7 +218,7 @@ def generateBatch(
     dtype: torch.dtype,
     elementCount: int | None = None,
     aspectRatio: float | None = None,
-    weightsType: str = "random",
+    weightsType: str = "uniform",
     targetLLA: torch.Tensor | None = None,
 ) -> ArrayBatch:
     if elementCount is None:

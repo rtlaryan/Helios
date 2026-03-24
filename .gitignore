@@ -2,3 +2,11 @@
 .pytest_cache
 *.m
 *pycache*
+data/
+runs/
+*.json
+*.pt
+*.log
+.ipynb_checkpoints/
+heliosDebug.ipynb
+.pre-commit-config.yaml

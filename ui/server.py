@@ -83,11 +83,13 @@ def target_generate():
         resolution = float(body.get("resolution_deg", 0.5))
         lat_range = body.get("lat_range")  # [min, max] or None
         lon_range = body.get("lon_range")  # [min, max] or None
+        normalize = bool(body.get("normalize", False))
         maps = build_target_maps(
             zones,
             resolution_deg=resolution,
             lat_range=tuple(lat_range) if lat_range else None,
             lon_range=tuple(lon_range) if lon_range else None,
+            normalize=normalize,
         )
         _current_maps = maps
         return jsonify(

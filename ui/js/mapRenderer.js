@@ -13,28 +13,47 @@ const MapRenderer = (() => {
         canvas.style.height = '110px';
         const ctx = canvas.getContext('2d');
         const img = ctx.createImageData(W, H);
+        const isLinear = maps.power_normalized;
 
-        // Find global min/max
+        // Find signal min/max — exclude the -100 dB floor sentinel (no-signal pixels)
         let mn = Infinity, mx = -Infinity;
-        maps.power_map.forEach(row => row.forEach(v => { if (v < mn) mn = v; if (v > mx) mx = v; }));
-        document.getElementById('power-min-label').textContent = mn.toFixed(0);
-        document.getElementById('power-max-label').textContent = mx.toFixed(0) + ' dB';
+        maps.power_map.forEach(row => row.forEach(v => {
+            const skip = !isLinear && v <= -99.9;
+            if (!skip) { if (v < mn) mn = v; if (v > mx) mx = v; }
+        }));
+        if (!isFinite(mn)) mn = isLinear ? 0 : -100;
+
+        if (isLinear) {
+            document.getElementById('power-min-label').textContent = '0.0';
+            document.getElementById('power-max-label').textContent = '1.0 (linear)';
+        } else {
+            document.getElementById('power-min-label').textContent = mn.toFixed(0);
+            document.getElementById('power-max-label').textContent = mx.toFixed(0) + ' dB';
+        }
 
         const range = mx - mn || 1;
         for (let r = 0; r < H; r++) {
             for (let c = 0; c < W; c++) {
-                // lat_vec runs south→north, so row 0 of canvas = north: read from H-1-r
                 const val = maps.power_map[H - 1 - r][c];
-                const t   = (val - mn) / range;
-                // Jet-like colormap
-                let rv, gv, bv;
-                if      (t < 0.25) { rv = 0;   gv = Math.round(t * 4 * 255);             bv = 255; }
-                else if (t < 0.5)  { rv = 0;   gv = 255; bv = Math.round((1 - (t - 0.25) * 4) * 255); }
-                else if (t < 0.75) { rv = Math.round((t - 0.5) * 4 * 255); gv = 255;     bv = 0; }
-                else               { rv = 255; gv = Math.round((1 - (t - 0.75) * 4) * 255); bv = 0; }
+                const t   = Math.max(0, Math.min(1, (val - mn) / range));
+                let rv, gv, bv, av;
+                if (isLinear) {
+                    // Purple→blue→white gradient matching importance style but distinct
+                    rv = Math.round(t * 59  + (1 - t) * 4);
+                    gv = Math.round(t * 130 + (1 - t) * 20);
+                    bv = Math.round(t * 246 + (1 - t) * 80);
+                    av = val < 0.01 ? 20 : Math.round(t * 200 + 30);
+                } else {
+                    // Jet-like colormap for dB
+                    if      (t < 0.25) { rv = 0;   gv = Math.round(t * 4 * 255);             bv = 255; }
+                    else if (t < 0.5)  { rv = 0;   gv = 255; bv = Math.round((1 - (t - 0.25) * 4) * 255); }
+                    else if (t < 0.75) { rv = Math.round((t - 0.5) * 4 * 255); gv = 255;     bv = 0; }
+                    else               { rv = 255; gv = Math.round((1 - (t - 0.75) * 4) * 255); bv = 0; }
+                    av = val < mn + range * 0.05 ? 30 : 220;
+                }
                 const idx = (r * W + c) * 4;
                 img.data[idx] = rv; img.data[idx + 1] = gv; img.data[idx + 2] = bv;
-                img.data[idx + 3] = val < mn + range * 0.05 ? 30 : 220;
+                img.data[idx + 3] = av;
             }
         }
         ctx.putImageData(img, 0, 0);
@@ -130,21 +149,39 @@ const MapRenderer = (() => {
         const focusEnabled = document.getElementById('focus-enabled')?.checked;
         let lat_range = null, lon_range = null;
         if (focusEnabled) {
-            lat_range = [
-                parseFloat(document.getElementById('focus-lat-min').value),
-                parseFloat(document.getElementById('focus-lat-max').value),
-            ];
-            lon_range = [
-                parseFloat(document.getElementById('focus-lon-min').value),
-                parseFloat(document.getElementById('focus-lon-max').value),
-            ];
+            const buf = parseFloat(document.getElementById('focus-buffer')?.value ?? 10);
+            const allZones = HeliosState.zones;
+            let latMin = 90, latMax = -90, lonMin = 180, lonMax = -180;
+            for (const z of allZones) {
+                if (z.shape === 'polygon') {
+                    for (const v of z.verts) {
+                        latMin = Math.min(latMin, v.lat); latMax = Math.max(latMax, v.lat);
+                        lonMin = Math.min(lonMin, v.lon); lonMax = Math.max(lonMax, v.lon);
+                    }
+                } else {
+                    const r = z.radius_deg || 8;
+                    latMin = Math.min(latMin, z.lat - r); latMax = Math.max(latMax, z.lat + r);
+                    lonMin = Math.min(lonMin, z.lon - r); lonMax = Math.max(lonMax, z.lon + r);
+                }
+            }
+            lat_range = [Math.max(-90,  latMin - buf), Math.min(90,  latMax + buf)];
+            lon_range = [Math.max(-180, lonMin - buf), Math.min(180, lonMax + buf)];
+            const preview = document.getElementById('focus-bounds-preview');
+            if (preview) preview.textContent =
+                `lat [${lat_range[0].toFixed(0)}°, ${lat_range[1].toFixed(0)}°]  ` +
+                `lon [${lon_range[0].toFixed(0)}°, ${lon_range[1].toFixed(0)}°]`;
+        } else {
+            const preview = document.getElementById('focus-bounds-preview');
+            if (preview) preview.textContent = '';
         }
 
         const btns = document.querySelectorAll('.btn-generate');
         btns.forEach(btn => { btn.disabled = true; btn.innerHTML = '<div class="spinner"></div> Generating…'; });
 
+        const normalize = document.getElementById('zone-normalize')?.checked ?? false;
+
         try {
-            await HeliosAPI.generateMaps(zones, resolution, lat_range, lon_range);
+            await HeliosAPI.generateMaps(zones, resolution, lat_range, lon_range, normalize);
             const fullData = await HeliosAPI.getMaps();
             HeliosState.maps = fullData;
 

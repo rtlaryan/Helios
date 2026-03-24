@@ -4,7 +4,25 @@ import matplotlib.pyplot as plt
 import torch
 
 from .arrayBatch import ArrayBatch
-from .arraySimulation import arrayResponseSample
+from .arraySimulation import arrayResponseBatch, arrayResponseSample, normalizePower, todB
+from .coordinateTransforms import mapLLAtoArrayAZEL
+from .targetSpec import TargetSpec
+
+
+def _render_figure(fig) -> None:
+    try:
+        from IPython import get_ipython
+        from IPython.display import display
+
+        ipython = get_ipython()
+        if ipython is not None and getattr(ipython, "kernel", None) is not None:
+            display(fig)
+            plt.close(fig)
+            return
+    except Exception:
+        pass
+
+    plt.show()
 
 
 def plotArrayGeometry(batch: ArrayBatch, sampleID: int = 0, plotWeights: bool = True) -> None:
@@ -40,7 +58,7 @@ def plotArrayGeometry(batch: ArrayBatch, sampleID: int = 0, plotWeights: bool = 
     ax.set_title("Antenna Array Geometry")
     ax.set_box_aspect((0.1, 1, 1))
 
-    plt.show()
+    _render_figure(fig)
 
 
 def plotArrayFactor(
@@ -174,4 +192,125 @@ def plotArrayFactor(
         ax3.set_box_aspect((1, 1, 1))
 
     plt.tight_layout()
-    plt.show()
+    _render_figure(fig)
+
+
+def projectResponseOnTarget(
+    batch: ArrayBatch,
+    target: TargetSpec,
+    sampleID: int = 0,
+    normalizedInputs: bool = False,
+):
+    target = target.to(batch.device, batch.dtype)
+    targetAZEL = mapLLAtoArrayAZEL(batch, target.targetCoordinates)
+
+    batchResponse = arrayResponseBatch(batch, targetAZEL, dB=False, normalize=False)
+    if normalizedInputs:
+        targetPowerTensor = todB(target.powerMap.clamp_min(1e-12))
+        responseTensor = todB(normalizePower(batchResponse))
+    else:
+        targetPowerTensor = target.powerMap
+        responseTensor = todB(normalizePower(batchResponse))
+
+    responseDB = responseTensor.reshape(batch.batchSize, *target.targetShape)
+
+    targetPower = targetPowerTensor.detach().cpu().numpy()
+    responsePower = responseDB[sampleID].detach().cpu().numpy()
+    errorPower = responsePower - targetPower
+    latitudes = target.searchLatitudes.detach().cpu().numpy()
+    longitudes = target.searchLongitudes.detach().cpu().numpy()
+
+    vmin = min(float(targetPowerTensor.min().item()), float(responseDB[sampleID].min().item()))
+    vmax = max(float(targetPowerTensor.max().item()), float(responseDB[sampleID].max().item()))
+    errorLimit = max(abs(float(errorPower.min())), abs(float(errorPower.max())), 1e-6)
+    powerLabel = "Normalized Power (dB)" if normalizedInputs else "Power (dB)"
+    targetTitle = (
+        "Target Power Map (Normalized Input)" if normalizedInputs else "Target Power Map (dB)"
+    )
+    responseTitle = (
+        f"Normalized Array Response (Sample {sampleID})"
+        if normalizedInputs
+        else f"Array Response (Sample {sampleID})"
+    )
+    errorTitle = "Normalized Response Error (dB)" if normalizedInputs else "Response Error (dB)"
+    fullAzimuth = torch.linspace(-torch.pi, torch.pi, 361, device=batch.device, dtype=batch.dtype)
+    fullElevation = torch.linspace(
+        -torch.pi / 2, torch.pi / 2, 181, device=batch.device, dtype=batch.dtype
+    )
+    fullAzimuthGrid, fullElevationGrid = torch.meshgrid(fullAzimuth, fullElevation, indexing="ij")
+    fullResponse = arrayResponseSample(
+        batch,
+        sampleID,
+        fullAzimuthGrid,
+        fullElevationGrid,
+        dB=True,
+        normalize=True,
+    )
+    fullResponsePower = fullResponse.detach().cpu().numpy()
+    fullAzimuthDeg = torch.rad2deg(fullAzimuth).detach().cpu().numpy()
+    fullElevationDeg = torch.rad2deg(fullElevation).detach().cpu().numpy()
+
+    fig, axes = plt.subplots(1, 4, figsize=(14, 3), constrained_layout=True)
+
+    targetIm = axes[0].imshow(
+        targetPower,
+        origin="lower",
+        aspect="auto",
+        extent=[longitudes.min(), longitudes.max(), latitudes.min(), latitudes.max()],
+        vmin=vmin,
+        vmax=vmax,
+        cmap="viridis",
+    )
+    axes[0].set_title(targetTitle)
+    axes[0].set_xlabel("Longitude (deg)")
+    axes[0].set_ylabel("Latitude (deg)")
+    fig.colorbar(targetIm, ax=axes[0], pad=0.02, label=powerLabel)
+
+    responseIm = axes[1].imshow(
+        responsePower,
+        origin="lower",
+        aspect="auto",
+        extent=[longitudes.min(), longitudes.max(), latitudes.min(), latitudes.max()],
+        vmin=vmin,
+        vmax=vmax,
+        cmap="viridis",
+    )
+    axes[1].set_title(responseTitle)
+    axes[1].set_xlabel("Longitude (deg)")
+    axes[1].set_ylabel("Latitude (deg)")
+    fig.colorbar(responseIm, ax=axes[1], pad=0.02, label=powerLabel)
+
+    errorIm = axes[2].imshow(
+        errorPower,
+        origin="lower",
+        aspect="auto",
+        extent=[longitudes.min(), longitudes.max(), latitudes.min(), latitudes.max()],
+        vmin=-errorLimit,
+        vmax=errorLimit,
+        cmap="coolwarm",
+    )
+    axes[2].set_title(errorTitle)
+    axes[2].set_xlabel("Longitude (deg)")
+    axes[2].set_ylabel("Latitude (deg)")
+    fig.colorbar(errorIm, ax=axes[2], pad=0.02, label="Error (dB)")
+
+    fullResponseIm = axes[3].imshow(
+        fullResponsePower.T,
+        origin="lower",
+        aspect="auto",
+        extent=[
+            fullAzimuthDeg.min(),
+            fullAzimuthDeg.max(),
+            fullElevationDeg.min(),
+            fullElevationDeg.max(),
+        ],
+        vmin=-40.0,
+        vmax=0.0,
+        cmap="viridis",
+    )
+    axes[3].set_title(f"Full Array Response (dB, Sample {sampleID})")
+    axes[3].set_xlabel("Azimuth (deg)")
+    axes[3].set_ylabel("Elevation (deg)")
+    fig.colorbar(fullResponseIm, ax=axes[3], pad=0.02, label="Power (dB)")
+
+    _render_figure(fig)

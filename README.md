@@ -1,0 +1,56 @@
+# Helios
+
+**RL + DL-based phased array beamforming research framework**
+
+Helios is a comprehensive research tool that combines Deep Learning and Reinforcement Learning to optimize phased array beamforming. It features a robust Python simulation backend, a powerful ML training pipeline, and an interactive web-based UI for real-time visualization and configuration.
+
+## Features
+
+- **Phased Array Simulation**: Fast, PyTorch-accelerated calculations of complex beamforming patterns and coordinate transformations.
+- **RL/DL Optimization**: Automatically evolve element excitations to achieve desired mainlobe placement and strict sidelobe suppression.
+- **Interactive UI**: A local web interface (with a 3D globe) for editing target focuses, setting constraints, and visualizing the resulting beam patterns.
+
+## Directory Structure
+
+- `scripts/`: Core simulation and data generation modules (`arraySimulation.py`, `batchFactory.py`, etc.).
+- `train/`: Machine Learning pipelines to optimize array configurations (`evolve.py`, `objective.py`).
+- `ui/`: Web interface and backend server for interactive configuration and visualization.
+- `data/` & `runs/` (ignored): Scratch space for tensorboard logs, saved models, and simulation datasets.
+
+## Getting Started
+
+### Prerequisites
+
+You need `conda` (or `miniconda`) installed to easily manage dependencies.
+
+### Installation
+
+1. Create the conda environment from the provided configuration:
+   ```bash
+   conda env create -f environment.yml
+   ```
+2. Activate the environment:
+   ```bash
+   conda activate helios
+   ```
+
+### Running the Application
+
+To start the interactive web application, run the UI server:
+
+```bash
+python ui/server.py
+```
+This will start a Flask server. Open your browser to the URL provided in the terminal (usually `http://127.0.0.1:8000`) to access the interface.
+
+## Formatting & Linting
+
+This project uses `ruff` for code formatting and linting.
+To check the code:
+```bash
+ruff check .
+```
+To format the code:
+```bash
+ruff format .
+```

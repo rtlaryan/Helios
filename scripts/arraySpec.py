@@ -19,7 +19,13 @@ class ArraySpec:
     failRate: float = 0.0
 
     # Array Constraints
-    allowedElementCount: Sequence[int] = (64,)  # , 144, 256, 400, 576)
+    allowedElementCount: Sequence[int] = (
+        64,
+        144,
+        256,
+        400,
+        576,
+    )
     allowedAspectRatio: Sequence[float] = (1,)  # , 1 / 2, 1 / 4, 1 / 8)
     geometry: ArrayType = "URA"
     gainRange: tuple[float, float] = (1.0, 1.0)  # fixed gain

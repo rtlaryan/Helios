@@ -35,14 +35,16 @@ def _gaussian_blob(
     lon_grid: np.ndarray,
     center_lat: float,
     center_lon: float,
+    radius_deg: float,
     sigma_deg: float,
     peak_linear: float,
 ) -> np.ndarray:
-    """Return a 2D Gaussian power blob on the lat/lon grid."""
+    """Return a flat-top blob: uniform inside radius_deg, Gaussian rolloff outside."""
     dlat = lat_grid - center_lat
     dlon = (lon_grid - center_lon) * np.cos(np.radians(center_lat))
-    dist2 = dlat**2 + dlon**2
-    return peak_linear * np.exp(-dist2 / (2 * sigma_deg**2))
+    dist = np.sqrt(dlat**2 + dlon**2)
+    effective_dist = np.maximum(0.0, dist - radius_deg)
+    return peak_linear * np.exp(-(effective_dist**2) / (2 * max(sigma_deg, 0.01) ** 2))
 
 
 def _point_in_polygon_vectorized(
@@ -128,6 +130,7 @@ def build_target_maps(
     resolution_deg: float = 0.5,
     lat_range: tuple[float, float] | None = None,
     lon_range: tuple[float, float] | None = None,
+    normalize: bool = False,
 ) -> dict[str, Any]:
     """
     Build power and importance maps from a list of zone dicts.
@@ -173,10 +176,10 @@ def build_target_maps(
             if zone.get("type") == "power":
                 peak_db = float(zone.get("peak_db", 0.0))
                 peak_lin = 10 ** (peak_db / 10.0)
-                blob = _gaussian_blob(lat_grid, lon_grid, clat, clon, r_deg * sigma, peak_lin)
+                blob = _gaussian_blob(lat_grid, lon_grid, clat, clon, r_deg, sigma, peak_lin)
                 power_lin = np.maximum(power_lin, blob)
             else:
-                blob = _gaussian_blob(lat_grid, lon_grid, clat, clon, r_deg * sigma, 1.0)
+                blob = _gaussian_blob(lat_grid, lon_grid, clat, clon, r_deg, sigma, 1.0)
                 importance = np.maximum(importance, blob)
 
     # Normalise importance to [0, 1]
@@ -184,12 +187,28 @@ def build_target_maps(
     if imp_max > 0:
         importance = importance / imp_max
 
-    # Convert power to dB (floor at -60 dB)
-    floor_lin = 10 ** (-60 / 10.0)
+    if normalize:
+        # Output linear [0, 1] power map — no dB conversion
+        pwr_max = power_lin.max()
+        if pwr_max > 0:
+            power_out = (power_lin / pwr_max).astype(np.float32)
+        else:
+            power_out = power_lin.astype(np.float32)
+        return {
+            "lat_vec": lat_vec.tolist(),
+            "lon_vec": lon_vec.tolist(),
+            "power_map": power_out.tolist(),
+            "importance_map": importance.tolist(),
+            "shape": [H, W],
+            "power_normalized": True,
+        }
+
+    # Convert power to dB (floor at -100 dB)
+    floor_lin = 10 ** (-100 / 10.0)
     power_lin_safe = np.maximum(power_lin, floor_lin)
     power_db = 10.0 * np.log10(power_lin_safe)
     no_signal = power_lin < floor_lin
-    power_db[no_signal] = -60.0
+    power_db[no_signal] = -100.0
 
     return {
         "lat_vec": lat_vec.tolist(),
@@ -197,6 +216,7 @@ def build_target_maps(
         "power_map": power_db.tolist(),
         "importance_map": importance.tolist(),
         "shape": [H, W],
+        "power_normalized": False,
     }
 
 

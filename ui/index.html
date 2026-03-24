@@ -106,11 +106,20 @@
           </div>
           <div class="card-body">
 
-            <div class="slider-group">
-              <label>Peak Power (dB)</label>
-              <div class="slider-row">
-                <input type="range" id="zone-db" min="-30" max="30" step="1" value="0" />
-                <span class="slider-val" id="zone-db-val">0 dB</span>
+            <!-- PWR-only controls (hidden in IMP mode) -->
+            <div id="pwr-only-params">
+              <div class="slider-group">
+                <label>Peak Power (dB)</label>
+                <div class="slider-row">
+                  <input type="range" id="zone-db" min="-30" max="30" step="1" value="0" />
+                  <span class="slider-val" id="zone-db-val">0 dB</span>
+                </div>
+              </div>
+              <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+                <input type="checkbox" id="zone-normalize" style="cursor:pointer;" />
+                <label for="zone-normalize" style="font-size:11px;color:var(--text-dim);cursor:pointer;user-select:none;">
+                  Output linear [0, 1] power map
+                </label>
               </div>
             </div>
 
@@ -134,7 +143,7 @@
             <p class="hint" id="draw-hint">Hold <kbd>Shift</kbd> + Click on the globe to draw a zone.</p>
 
             <div style="margin-top:10px;">
-              <label style="font-size:10.5px;color:var(--text-dim);letter-spacing:.05em;">BEAM PROFILE PREVIEW</label>
+              <label style="font-size:10.5px;color:var(--text-dim);letter-spacing:.05em;" id="preview-label">BEAM PROFILE PREVIEW</label>
               <canvas id="rolloff-preview" style="width:100%;height:72px;border-radius:6px;background:var(--bg-input);display:block;margin-top:4px;"></canvas>
             </div>
           </div>
@@ -146,46 +155,34 @@
             DEFINED ZONES
             <span id="zone-count-badge" style="margin-left:auto;font-size:10px;color:var(--text-dim);">0 zones</span>
           </div>
-          <div class="card-body" id="zone-list-body" style="max-height:180px;overflow-y:auto;padding-right:4px;">
+          <div class="card-body" id="zone-list-body" style="max-height:280px;overflow-y:auto;padding-right:4px;">
             <p class="hint" id="zone-empty-hint">No zones defined yet.</p>
           </div>
         </div>
         
         <!-- Focus Region card -->
-        <div class="card">
-          <div class="card-header" id="focus-header" style="cursor:pointer;">
+        <div class="card collapsed" id="card-focus">
+          <div class="card-header">
             <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M3 12h2M19 12h2M12 3v2M12 19v2"/><circle cx="12" cy="12" r="9" opacity=".3"/></svg>
             FOCUS REGION
-            <label id="focus-enable-label" style="margin-left:auto;display:flex;align-items:center;gap:6px;font-size:11px;font-weight:400;cursor:pointer;">
+            <label id="focus-enable-label" style="margin-left:auto;display:flex;align-items:center;gap:6px;font-size:11px;font-weight:400;cursor:pointer;" onclick="event.stopPropagation()">
               <input type="checkbox" id="focus-enabled" style="cursor:pointer;" />
               Enable
             </label>
+            <span class="fold-icon">
+              <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="6,9 12,15 18,9"/></svg>
+            </span>
           </div>
-          <div class="card-body" id="focus-body" style="display:none;">
-            <p class="hint">Constrain maps to a sub-region for higher effective resolution.</p>
-            <div class="field-row">
-              <div class="field">
-                <label>Lat min (°)</label>
-                <input type="number" id="focus-lat-min" value="-60" min="-90" max="90" step="1" />
-              </div>
-              <div class="field">
-                <label>Lat max (°)</label>
-                <input type="number" id="focus-lat-max" value="60" min="-90" max="90" step="1" />
+          <div class="card-body">
+            <p class="hint">Adds a buffer around the bounding box of all drawn zones, constraining the grid to a sub-region for higher effective resolution.</p>
+            <div class="slider-group">
+              <label>Buffer / Padding (°)</label>
+              <div class="slider-row">
+                <input type="range" id="focus-buffer" min="10" max="120" step="1" value="10" />
+                <span class="slider-val" id="focus-buffer-val">10°</span>
               </div>
             </div>
-            <div class="field-row">
-              <div class="field">
-                <label>Lon min (°)</label>
-                <input type="number" id="focus-lon-min" value="-180" min="-180" max="180" step="1" />
-              </div>
-              <div class="field">
-                <label>Lon max (°)</label>
-                <input type="number" id="focus-lon-max" value="180" min="-180" max="180" step="1" />
-              </div>
-            </div>
-            <button class="btn btn-secondary btn-full" id="btn-focus-from-zones" style="margin-top:6px;font-size:11px;">
-              Auto-fit to drawn zones
-            </button>
+            <p class="hint" id="focus-bounds-preview" style="color:var(--accent);font-size:10px;margin-top:4px;"></p>
           </div>
         </div>
 

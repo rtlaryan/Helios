@@ -23,10 +23,10 @@ window.HeliosAPI = {
     },
 
     // Generate target maps from zone list
-    async generateMaps(zones, resolutionDeg = 0.5, lat_range = null, lon_range = null) {
+    async generateMaps(zones, resolutionDeg = 0.5, lat_range = null, lon_range = null, normalize = false) {
         return this._fetch('/api/target/generate', {
             method: 'POST',
-            body: JSON.stringify({ zones, resolution_deg: resolutionDeg, lat_range, lon_range }),
+            body: JSON.stringify({ zones, resolution_deg: resolutionDeg, lat_range, lon_range, normalize }),
         });
     },
 
