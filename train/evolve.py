@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
+import shutil
 
 import torch
 from scripts.arrayBatch import ArrayBatch, merge
@@ -10,7 +11,7 @@ from scripts.targetSpec import TargetSpec
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
-from train.objective import LossParameters, LossType, batchLoss
+from train.objective import LossConfig, LossType, batchLoss
 
 
 @dataclass
@@ -30,9 +31,9 @@ class EvolutionConfig:
     amplitudeSigma: float = 0.02
     gainSigma: float = 0
 
-    phaseSigmaDecay: float = 0.998
-    amplitudeSigmaDecay: float = 0.995
-    randomFractionDecay: float = 0.998
+    phaseSigmaDecay: float = 0.999
+    amplitudeSigmaDecay: float = 0.998
+    randomFractionDecay: float = 0.999
 
     phaseMinSigma: float = 1e-3
     amplitudeMinSigma: float = 1e-4
@@ -87,13 +88,79 @@ class EvolutionController:
     config: EvolutionConfig
     targetSpec: TargetSpec
     arraySpec: ArraySpec
-    lossParams: LossParameters
+    lossParams: LossConfig
     experimentName: str = "evo_1"
     writer: SummaryWriter | None = None
 
     @property
     def archiveLocation(self) -> Path:
         return Path("data/archive") / self.experimentName
+
+    def runLocation(self, logDir: str | Path | None) -> Path | None:
+        if logDir is None:
+            return None
+        return Path(logDir) / self.experimentName
+
+    def resetExperiment(self, logDir: str | Path | None) -> None:
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
+
+        if self.archiveLocation.exists():
+            shutil.rmtree(self.archiveLocation)
+
+        runLocation = self.runLocation(logDir)
+        if runLocation is not None and runLocation.exists():
+            shutil.rmtree(runLocation)
+
+    def listStepPaths(self) -> list[Path]:
+        return sorted(self.archiveLocation.glob("step_*.pt"))
+
+    def loadResumeState(self, device: torch.device) -> dict | None:
+        stepPaths = self.listStepPaths()
+        if not stepPaths:
+            return None
+
+        historyBest: list[float] = []
+        historyMean: list[float] = []
+        historyWorst: list[float] = []
+        bestScoreOverall: float | None = None
+        bestStepOverall: int | None = None
+        bestSampleOverall: dict | None = None
+
+        for stepPath in stepPaths:
+            payload = torch.load(stepPath, weights_only=False)
+            summary = payload["summary"]
+            historyBest.append(float(summary["bestScore"]))
+            historyMean.append(float(summary["meanScore"]))
+            historyWorst.append(float(summary["worstScore"]))
+
+            bestScore = float(summary["bestScore"])
+            if bestScoreOverall is None or bestScore < bestScoreOverall:
+                bestScoreOverall = bestScore
+                bestStepOverall = int(payload["step"])
+                bestSampleOverall = {
+                    **payload["bestSample"],
+                    "step": int(payload["step"]),
+                }
+
+        latestPayload = torch.load(stepPaths[-1], weights_only=False)
+        batch = ArrayBatch.fromSerializedBatch(latestPayload["batch"]).to(device)
+        latestStep = int(latestPayload["step"])
+        if latestStep < self.config.evolutionSteps - 1:
+            scores = latestPayload["scores"].to(device)
+            batch = self.evolutionStep(latestStep, batch, scores)
+
+        return {
+            "batch": batch,
+            "startStep": latestStep + 1,
+            "bestScoreOverall": bestScoreOverall,
+            "bestStepOverall": bestStepOverall,
+            "bestSampleOverall": bestSampleOverall,
+            "historyBest": historyBest,
+            "historyMean": historyMean,
+            "historyWorst": historyWorst,
+        }
 
     def logInit(self) -> Path:
         archiveDir = self.archiveLocation
@@ -216,22 +283,62 @@ class EvolutionController:
         device: torch.device,
         logDir: str | Path | None = "runs",
         plotProjection: bool = False,
+        resume: bool = True,
     ) -> dict:
-        if self.writer is None and logDir is not None:
-            logPath = Path(logDir) / self.experimentName
-            self.writer = SummaryWriter(log_dir=str(logPath))
+        if not resume:
+            self.resetExperiment(logDir)
 
-        batch = self.initEvolution(dtype=dtype, device=device)
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
 
-        bestScoreOverall: float | None = None
-        bestStepOverall: int | None = None
-        bestSampleOverall: dict | None = None
+        resumeState = self.loadResumeState(device=device) if resume else None
+        if resumeState is None:
+            batch = self.initEvolution(dtype=dtype, device=device)
+            startStep = 0
+            bestScoreOverall: float | None = None
+            bestStepOverall: int | None = None
+            bestSampleOverall: dict | None = None
+            historyBest: list[float] = []
+            historyMean: list[float] = []
+            historyWorst: list[float] = []
+        else:
+            batch = resumeState["batch"]
+            startStep = int(resumeState["startStep"])
+            bestScoreOverall = resumeState["bestScoreOverall"]
+            bestStepOverall = resumeState["bestStepOverall"]
+            bestSampleOverall = resumeState["bestSampleOverall"]
+            historyBest = resumeState["historyBest"]
+            historyMean = resumeState["historyMean"]
+            historyWorst = resumeState["historyWorst"]
 
-        historyBest: list[float] = []
-        historyMean: list[float] = []
-        historyWorst: list[float] = []
+        if logDir is not None:
+            logPath = self.runLocation(logDir)
+            assert logPath is not None
+            self.writer = SummaryWriter(log_dir=str(logPath), purge_step=startStep)
 
-        pbar = tqdm(range(self.config.evolutionSteps), desc=f"Evolving {self.experimentName}")
+        if startStep >= self.config.evolutionSteps:
+            finalPayload = {
+                "experimentName": self.experimentName,
+                "bestScoreOverall": bestScoreOverall,
+                "bestStepOverall": bestStepOverall,
+                "bestSampleOverall": bestSampleOverall,
+                "history": {
+                    "bestScore": torch.tensor(historyBest),
+                    "meanScore": torch.tensor(historyMean),
+                    "worstScore": torch.tensor(historyWorst),
+                },
+            }
+            savePath = self.archiveLocation / "final.pt"
+            torch.save(finalPayload, savePath)
+            if self.writer:
+                self.writer.close()
+                self.writer = None
+            return finalPayload
+
+        pbar = tqdm(
+            range(startStep, self.config.evolutionSteps), desc=f"Evolving {self.experimentName}"
+        )
         for step in pbar:
             scores = self.getScores(batch)
 
@@ -239,6 +346,10 @@ class EvolutionController:
             bestScore = float(scores[bestIdx].item())
             meanScore = float(scores.mean().item())
             worstScore = float(scores.max().item())
+
+            bestBatchPath = self.archiveLocation / "best.pt"
+            bestBatchPath.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(batch.fetch(bestIdx).to(torch.device("cpu")), bestBatchPath)
 
             historyBest.append(bestScore)
             historyMean.append(meanScore)
@@ -282,5 +393,6 @@ class EvolutionController:
 
         if self.writer:
             self.writer.close()
+            self.writer = None
 
         return finalPayload

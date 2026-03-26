@@ -9,4 +9,5 @@ runs/
 *.log
 .ipynb_checkpoints/
 heliosDebug.ipynb
-.pre-commit-config.yaml
+.*
+.ruff*

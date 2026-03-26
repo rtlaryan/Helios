@@ -117,6 +117,18 @@ class ArrayBatch:
             else self.elementMask[idx].detach().cpu(),
         }
 
+    @classmethod
+    def fromSerializedBatch(cls, payload: dict) -> "ArrayBatch":
+        return cls(
+            elementLocalPosition=payload["elementLocalPosition"],
+            weights=payload["weights"],
+            wavelength=payload["wavelength"],
+            gain=payload["gain"],
+            LLAPosition=payload["LLAPosition"],
+            ECEFPosition=payload["ECEFPosition"],
+            elementMask=payload["elementMask"],
+        )
+
 
 def merge(batches: list[ArrayBatch]) -> "ArrayBatch":
     referenceBatch = batches[0]

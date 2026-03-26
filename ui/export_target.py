@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 import torch
-
+from scripts.targetSpec import TargetSpec
 from ui.helios_bridge import build_target_maps, build_target_spec
 
 _ROOT = Path(__file__).parent.parent
@@ -44,7 +44,7 @@ def load_target_from_zones_json(json_path: str | Path, resolution_deg: float = 0
     return build_target_spec(maps)
 
 
-def load_target_from_pt(pt_path: str | Path):
+def load_target_from_pt(pt_path: str | Path) -> TargetSpec:
     """Load a previously saved TargetSpec from a .pt file."""
     return torch.load(str(pt_path), weights_only=False)
 
