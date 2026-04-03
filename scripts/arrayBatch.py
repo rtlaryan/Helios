@@ -3,6 +3,17 @@ from dataclasses import dataclass
 import torch
 
 
+def _normalize_amplitudes(
+    amplitude: torch.Tensor,
+    elementMask: torch.Tensor | None = None,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    if elementMask is not None:
+        amplitude = amplitude * elementMask.to(dtype=amplitude.dtype)
+    norm = amplitude.norm(dim=1, keepdim=True).clamp_min(eps)
+    return amplitude / norm
+
+
 @dataclass
 class ArrayBatch:
     elementLocalPosition: torch.Tensor  # [B, 3, N] (Real)
@@ -79,9 +90,38 @@ class ArrayBatch:
 
         mutatedAmplitude = amplitude * (1.0 + amplitudeNoise)
         mutatedAmplitude = mutatedAmplitude.clamp_min(0.0)
-        mutatedAmplitude = mutatedAmplitude / mutatedAmplitude.norm(dim=1, keepdim=True)
+        mutatedAmplitude = _normalize_amplitudes(mutatedAmplitude, self.elementMask)
 
         weights = mutatedAmplitude * torch.exp(1j * mutatedPhase)
+
+        return ArrayBatch(
+            elementLocalPosition=self.elementLocalPosition,
+            weights=weights,
+            wavelength=self.wavelength,
+            gain=self.gain,
+            LLAPosition=self.LLAPosition,
+            ECEFPosition=self.ECEFPosition,
+            elementMask=self.elementMask,
+        )
+
+    def crossoverWeights(
+        self,
+        partner: "ArrayBatch",
+        generator: torch.Generator | None = None,
+    ) -> "ArrayBatch":
+        if self.batchSize != partner.batchSize:
+            raise ValueError("crossover batches must have the same batch size")
+        if self.N != partner.N:
+            raise ValueError("crossover batches must have the same element count")
+
+        selectionMask = torch.rand(
+            self.weights.shape,
+            device=self.weights.device,
+            generator=generator,
+        ) < 0.5
+        weights = torch.where(selectionMask, self.weights, partner.weights)
+        normalizedAmplitude = _normalize_amplitudes(weights.abs(), self.elementMask)
+        weights = normalizedAmplitude * torch.exp(1j * weights.angle())
 
         return ArrayBatch(
             elementLocalPosition=self.elementLocalPosition,

@@ -1,13 +1,13 @@
 # Helios
 
-**RL + DL-based phased array beamforming research framework**
+**Phased array beamforming research framework**
 
-Helios is a comprehensive research tool that combines Deep Learning and Reinforcement Learning to optimize phased array beamforming. It features a robust Python simulation backend, a powerful ML training pipeline, and an interactive web-based UI for real-time visualization and configuration.
+Helios is a research tool for phased array beamforming. It includes a PyTorch simulation backend, an evolutionary training pipeline for optimizing array excitations against spatial targets, and a local web UI for visualization and configuration.
 
 ## Features
 
 - **Phased Array Simulation**: Fast, PyTorch-accelerated calculations of complex beamforming patterns and coordinate transformations.
-- **RL/DL Optimization**: Automatically evolve element excitations to achieve desired mainlobe placement and strict sidelobe suppression.
+- **Evolutionary Optimization**: Optimize element excitations with directed initialization, crossover, adaptive mutation schedules, and stagnation-aware exploration boosts.
 - **Interactive UI**: A local web interface (with a 3D globe) for editing target focuses, setting constraints, and visualizing the resulting beam patterns.
 
 ## Directory Structure
@@ -42,6 +42,16 @@ To start the interactive web application, run the UI server:
 python ui/server.py
 ```
 This will start a Flask server. Open your browser to the URL provided in the terminal (usually `http://127.0.0.1:8000`) to access the interface.
+
+## YAML Training Runs
+
+The training stack now supports typed YAML configs and a CLI entrypoint:
+
+```bash
+conda run -n helios python -m train.run --config path/to/run.yaml
+```
+
+For the full training/YAML guide, target config options, clone/crossover/mutate/random scheduling, adaptive sigma controls, logging modes, notebook usage, and output layout, see `train/README.md`.
 
 ## Formatting & Linting
 

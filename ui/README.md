@@ -17,6 +17,8 @@ python -m ui.server
 
 Open **http://localhost:5050** in a browser.
 
+The UI is separate from the YAML-based training pipeline. For the evolutionary trainer, config fields, and checkpoint/logging outputs, see `train/README.md`.
+
 ---
 
 ## Architecture

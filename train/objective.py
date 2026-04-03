@@ -1,370 +1,512 @@
 from dataclasses import dataclass, field
 from typing import Literal
+import time
 
 import torch
+import torch.nn.functional as F
 from scripts.arrayBatch import ArrayBatch
-from scripts.arraySimulation import arrayResponseBatch
-from scripts.coordinateTransforms import mapLLAtoArrayAZEL
-from scripts.targetSpec import TargetSpec
+from scripts.arraySimulation import (
+    ChunkShapeStrategy,
+    arrayResponseBatch,
+    resolveResponseChunkSize,
+    useChunkShapeStrategy,
+)
+from scripts.coordinateTransforms import LLAtoECEF, getECEFtoENUMapping, mapLLAtoArrayAZEL
+from scripts.targetSpec import TargetBatch, TargetLike, TargetSpec
+from train.nvtx import (
+    EVALUATE_LINEAR_RESPONSE_RANGE,
+    EVALUATE_LOSS_ASSEMBLY_RANGE,
+    EVALUATE_SUPPORT_MASK_RANGE,
+    EVALUATE_TARGET_PROJECTION_RANGE,
+    EVALUATE_TOTAL_RANGE,
+    EVALUATE_WIDE_RESPONSE_RANGE,
+    nvtx_range,
+)
 
 LossType = Literal["MSE", "HUBER"]  # kept for backward compat, unused internally
+TargetMode = Literal["auto", "shared", "per_sample"]
 
 
 @dataclass
 class LossConfig:
-    """Configuration for the 4-term beamforming loss.
-
-    Terms:
-        shape  — KL divergence + cosine similarity blend (distribution shape match)
-        eff    — power efficiency: fraction of power inside importance-weighted region
-        psl    — peak sidelobe level penalty relative to weakest beam peak
-        wide   — wide-area spill: power fraction outside the search area entirely
-
-    All four terms are naturally O(1), so weights represent true relative importance.
-    """
-
     w_shape: float = 1.0
-    w_eff: float = 0.5
-    w_psl: float = 0.5
-    w_wide: float = 0.4
-
-    # KL vs cosine blend in shape term (1.0 = pure KL, 0.0 = pure cosine)
-    alpha: float = 0.7
-
-    # PSL floor in the bounded ratio space: outsidePeak / (minZonePeak + outsidePeak).
-    # 0.05 ≈ outsidePeak is 1/19 of min zone peak (~−26 dB), 0.09 ≈ −20 dB
-    sidelobe_floor: float = 0.05
-
-    # Gaussian sigma (degrees) used to compute per-zone peak power for PSL reference
-    hotspot_sigma: float = 2.0
-
-    # Wide-area scan: coarse grid resolution (wide_grid_size × wide_grid_size points)
-    # over the full sphere (AZ ∈ [-π, π], EL ∈ [-π/2, π/2]).
+    w_eff: float = 0.1
+    w_wide: float = 5
     wide_grid_size: int = 256
-
-    # Extra AZ/EL margin (radians) added to the search area bounding box before
-    # classifying wide-grid cells as "inside".  Allows the beam's near-field
-    # rolloff to stay outside the penalty region.  0.0 = strict search area boundary.
-    wide_padding: float = 0.05
+    wide_support_dilation_cells: int = 1
 
 
-# ---------------------------------------------------------------------------
-# Backward-compatible alias so existing notebooks/scripts don't break
-# ---------------------------------------------------------------------------
 LossParameters = LossConfig
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
+@dataclass
+class TargetPrep:
+    targetCoordinates: torch.Tensor
+    powerFlat: torch.Tensor
+    importanceFlat: torch.Tensor
+    targetShape: torch.Size
+    targetECEF: torch.Tensor | None = None
+
+
+@dataclass
+class EvaluationDiagnostics:
+    targetProjectionMS: float = 0.0
+    linearResponseMS: float = 0.0
+    wideResponseMS: float = 0.0
+    supportMaskMS: float = 0.0
+    totalMS: float = 0.0
+    gpuMaxMemoryMB: float | None = None
+    usedSharedTargetFastPath: bool = False
+    linearResponseChunkSize: int | None = None
+    wideResponseChunkSize: int | None = None
+
+    @classmethod
+    def zeroedFrom(cls, other: "EvaluationDiagnostics") -> "EvaluationDiagnostics":
+        return cls(
+            usedSharedTargetFastPath=other.usedSharedTargetFastPath,
+            linearResponseChunkSize=other.linearResponseChunkSize,
+            wideResponseChunkSize=other.wideResponseChunkSize,
+        )
+
+    @classmethod
+    def merge(cls, diagnostics: list["EvaluationDiagnostics"]) -> "EvaluationDiagnostics":
+        gpuPeaks = [value.gpuMaxMemoryMB for value in diagnostics if value.gpuMaxMemoryMB is not None]
+        return cls(
+            targetProjectionMS=sum(value.targetProjectionMS for value in diagnostics),
+            linearResponseMS=sum(value.linearResponseMS for value in diagnostics),
+            wideResponseMS=sum(value.wideResponseMS for value in diagnostics),
+            supportMaskMS=sum(value.supportMaskMS for value in diagnostics),
+            totalMS=sum(value.totalMS for value in diagnostics),
+            gpuMaxMemoryMB=max(gpuPeaks) if gpuPeaks else None,
+            usedSharedTargetFastPath=any(value.usedSharedTargetFastPath for value in diagnostics),
+            linearResponseChunkSize=next(
+                (value.linearResponseChunkSize for value in reversed(diagnostics) if value.linearResponseChunkSize is not None),
+                None,
+            ),
+            wideResponseChunkSize=next(
+                (value.wideResponseChunkSize for value in reversed(diagnostics) if value.wideResponseChunkSize is not None),
+                None,
+            ),
+        )
+
+
+@dataclass
+class BatchEvaluation:
+    totalLoss: torch.Tensor
+    shapeLoss: torch.Tensor
+    efficiencyLoss: torch.Tensor
+    wideSupportLoss: torch.Tensor
+    linearResponse: torch.Tensor
+    targetAZEL: tuple[torch.Tensor, torch.Tensor]
+    targetMode: TargetMode
+    diagnostics: EvaluationDiagnostics = field(default_factory=EvaluationDiagnostics)
+
+
+_SHARED_TARGET_CACHE: dict[tuple[int | float, ...], TargetPrep] = {}
+_WIDE_GRID_CACHE: dict[tuple[torch.device, torch.dtype, int], tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _sharedTargetCacheKey(target: TargetSpec, dtype: torch.dtype) -> tuple[int | float, ...]:
+    return (
+        target.searchLatitudes.data_ptr(),
+        target.searchLatitudes._version,
+        target.searchLongitudes.data_ptr(),
+        target.searchLongitudes._version,
+        target.importanceMap.data_ptr(),
+        target.importanceMap._version,
+        target.powerMap.data_ptr(),
+        target.powerMap._version,
+        target.hotspotCoordinates.data_ptr(),
+        target.hotspotCoordinates._version,
+        hash(dtype),
+        float(target.thresholdDB),
+    )
 
 
 def _to_linear(powerMap: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
-    """Convert powerMap to linear scale.
-
-    Detects dB scale by the presence of any negative values.
-    Assumes normalized linear maps already lie in [0, 1].
-    """
     if torch.any(powerMap < 0):
-        # dB scale detected — convert to linear
         return torch.pow(10.0, powerMap / 10.0).clamp_min(eps)
     return powerMap.clamp_min(0.0)
 
 
-def _as_distribution(tensor: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
-    """Normalise flat [N] or batched [B, N] tensor to a probability distribution."""
-    return tensor / tensor.sum(dim=-1, keepdim=True).clamp_min(eps)
+def _resolveTargetMode(target: TargetLike, targetMode: TargetMode) -> TargetMode:
+    if targetMode == "auto":
+        return "per_sample" if isinstance(target, TargetBatch) else "shared"
+    if targetMode == "shared" and isinstance(target, TargetBatch):
+        raise ValueError("targetMode='shared' is incompatible with TargetBatch")
+    if targetMode == "per_sample" and isinstance(target, TargetSpec):
+        raise ValueError("targetMode='per_sample' is incompatible with TargetSpec")
+    return targetMode
 
 
-# ---------------------------------------------------------------------------
-# Term 1: Shape Fidelity
-# ---------------------------------------------------------------------------
+def _prepareSharedTarget(target: TargetSpec, dtype: torch.dtype) -> TargetPrep:
+    key = _sharedTargetCacheKey(target, dtype)
+    cached = _SHARED_TARGET_CACHE.get(key)
+    if cached is not None:
+        return cached
 
-
-def shapeFidelityLoss(
-    linearResponse: torch.Tensor,
-    target: TargetSpec,
-    alpha: float = 0.7,
-    eps: float = 1e-10,
-) -> torch.Tensor:
-    """KL divergence + cosine similarity blend between response and target distributions.
-
-    Args:
-        linearResponse: [B, H, W] raw linear power (unnormalised)
-        target:         TargetSpec with powerMap [H, W]
-        alpha:          weight given to KL term (1-alpha goes to cosine)
-        eps:            numerical floor
-
-    Returns:
-        [B] loss — lower is better
-    """
-    B = linearResponse.shape[0]
-    responseFlat = linearResponse.flatten(1)  # [B, N]
-
-    targetLinear = _to_linear(target.powerMap, eps=eps).flatten()  # [N]
-    P_resp = _as_distribution(responseFlat, eps=eps)  # [B, N]
-    P_targ = _as_distribution(targetLinear.unsqueeze(0), eps=eps)  # [1, N]
-
-    # --- KL(target || response) — penalises response mass missing from target ---
-    # Guard: where P_targ == 0 the KL contribution is 0 by definition,
-    # but 0 * log(0 / anything) = 0 * -inf = NaN in floating point.
-    # Use torch.where so the log is never evaluated at zero-target cells.
-    log_ratio = torch.where(
-        P_targ > eps,
-        torch.log((P_targ / P_resp.clamp_min(eps)).clamp_min(eps)),
-        torch.zeros_like(P_targ),
+    targetCoordinates = target.targetCoordinates
+    targetLLA = torch.cat(
+        [targetCoordinates, torch.zeros_like(targetCoordinates[:, :1])],
+        dim=-1,
     )
-    kl = (P_targ * log_ratio).sum(dim=-1)  # [B]
-
-    # --- 1 − cosine similarity ---
-    dot = (P_resp * P_targ).sum(dim=-1)  # [B]
-    norm_resp = P_resp.norm(dim=-1).clamp_min(eps)
-    norm_targ = P_targ.norm(dim=-1).clamp_min(eps)
-    cos_sim = dot / (norm_resp * norm_targ)
-    one_minus_cos = 1.0 - cos_sim  # [B]
-
-    return alpha * kl + (1.0 - alpha) * one_minus_cos
-
-
-# ---------------------------------------------------------------------------
-# Term 2: Power Efficiency
-# ---------------------------------------------------------------------------
+    prep = TargetPrep(
+        targetCoordinates=targetCoordinates,
+        powerFlat=_to_linear(target.powerMap).flatten().unsqueeze(0),
+        importanceFlat=target.importanceMap.flatten().clamp(0.0, 1.0).unsqueeze(0),
+        targetShape=target.targetShape,
+        targetECEF=LLAtoECEF(targetLLA),
+    )
+    _SHARED_TARGET_CACHE[key] = prep
+    return prep
 
 
-def powerEfficiencyLoss(
+def _prepareBatchedTarget(target: TargetBatch) -> TargetPrep:
+    return TargetPrep(
+        targetCoordinates=target.targetCoordinates,
+        powerFlat=_to_linear(target.powerMap).flatten(1),
+        importanceFlat=target.importanceMap.flatten(1).clamp(0.0, 1.0),
+        targetShape=target.targetShape,
+    )
+
+
+def _prepareTarget(target: TargetLike, params: LossConfig, targetMode: TargetMode) -> TargetPrep:
+    del params
+    if targetMode == "shared":
+        assert isinstance(target, TargetSpec)
+        return _prepareSharedTarget(target, target.searchLatitudes.dtype)
+    assert isinstance(target, TargetBatch)
+    return _prepareBatchedTarget(target)
+
+
+def _shapeFidelityLoss(
     linearResponse: torch.Tensor,
-    target: TargetSpec,
+    prep: TargetPrep,
     eps: float = 1e-10,
 ) -> torch.Tensor:
-    """1 − (power inside importance-weighted region / total power).
+    responseFlat = linearResponse.flatten(1)
+    targetFlat = prep.powerFlat.expand_as(responseFlat)
+    weights = prep.importanceFlat.expand_as(responseFlat)
+    perPixel = F.smooth_l1_loss(responseFlat, targetFlat, reduction="none")
+    weightedLoss = (perPixel * weights).sum(dim=-1)
+    normalizer = weights.sum(dim=-1).clamp_min(eps)
+    return weightedLoss / normalizer
 
-    Uses the importanceMap as a soft mask, so the gradient is smooth and it
-    works naturally for multi-beam (importanceMap has nonzero weight at all zones).
 
-    Args:
-        linearResponse: [B, H, W] raw linear power
-        target:         TargetSpec with importanceMap [H, W] in [0, 1]
-
-    Returns:
-        [B] loss ∈ [0, 1] — lower is better
-    """
-    responseFlat = linearResponse.flatten(1)  # [B, N]
-
-    # importanceMap is already normalised [0, 1]; use as soft mask directly
-    softMask = target.importanceMap.flatten().clamp(0.0, 1.0).unsqueeze(0)  # [1, N]
-
-    insidePower = (responseFlat * softMask).sum(dim=-1)           # [B]
-    totalPower = responseFlat.sum(dim=-1).clamp_min(eps)           # [B]
-    efficiency = insidePower / totalPower                           # [B] ∈ [0, 1]
-
+def _powerEfficiencyLoss(
+    linearResponse: torch.Tensor,
+    prep: TargetPrep,
+    eps: float = 1e-10,
+) -> torch.Tensor:
+    responseFlat = linearResponse.flatten(1)
+    insidePower = (responseFlat * prep.importanceFlat).sum(dim=-1)
+    totalPower = responseFlat.sum(dim=-1).clamp_min(eps)
+    efficiency = insidePower / totalPower
     return 1.0 - efficiency
 
 
-# ---------------------------------------------------------------------------
-# Term 3: Peak Sidelobe Level (PSL)
-# ---------------------------------------------------------------------------
+def _getWideGrid(
+    device: torch.device,
+    dtype: torch.dtype,
+    gridSize: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (device, dtype, gridSize)
+    cached = _WIDE_GRID_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    wideAZ = torch.linspace(-torch.pi, torch.pi, gridSize, device=device, dtype=dtype)
+    wideEL = torch.linspace(-torch.pi / 2, torch.pi / 2, gridSize, device=device, dtype=dtype)
+    cached = torch.meshgrid(wideAZ, wideEL, indexing="ij")
+    _WIDE_GRID_CACHE[key] = cached
+    return cached
 
 
-def peakSidelobeLoss(
-    linearResponse: torch.Tensor,
-    target: TargetSpec,
-    sidelobe_floor: float = 0.05,
-    hotspot_sigma: float = 2.0,
-    eps: float = 1e-10,
-) -> torch.Tensor:
-    """Bounded peak sidelobe level (PSL) penalty.
-
-    Computes  pslRatio = outsidePeak / (minZonePeak + outsidePeak) ∈ [0, 1]
-    which is always bounded — avoids division blow-up when the global beam
-    maximum is outside the target area.
-
-    Interpretation:
-      pslRatio → 0   all power inside the target footprint (ideal)
-      pslRatio → 0.5 equal peak power inside and outside (random-like)
-      pslRatio → 1   peak power entirely outside the target (off-target beam)
-
-    For multi-beam the zone reference is the *weakest* beam peak, so a strong
-    beam cannot mask sidelobe problems near a weaker one.
-
-    Args:
-        linearResponse: [B, H, W] raw linear power (any absolute scale)
-        target:         TargetSpec with hotspotCoordinates [K, 2] and importanceMap
-        sidelobe_floor: PSL ratio below which no penalty is applied.
-                        0.05 ≈ outsidePeak is 1/19 of the weakest zone peak (~−26 dB).
-                        0.09 ≈ −20 dB, 0.003 ≈ −30 dB.
-        hotspot_sigma:  Gaussian half-width (deg) that defines each beam's footprint.
-                        Cells where the Gaussian > 0.5 (≈ within 1.18σ) are treated
-                        as inside that zone.
-
-    Returns:
-        [B] loss ∈ [0, 1] — lower is better.
-    """
-    responseFlat = linearResponse.flatten(1)          # [B, N]
-    searchLat = target.searchLatitudes.flatten()      # [N]
-    searchLon = target.searchLongitudes.flatten()     # [N]
-    hotspots = target.hotspotCoordinates              # [K, 2]
-    softMask = target.importanceMap.flatten().clamp(0.0, 1.0)   # [N]
-    outsideMask = (1.0 - softMask).clamp(0.0, 1.0)             # [N]
-
-    # Normalise response to peak=1. PSL is a purely relative metric — absolute
-    # scale cancels — and normalisation keeps all values in [0, 1].
-    globalPeak = responseFlat.amax(dim=-1, keepdim=True).clamp_min(eps)  # [B, 1]
-    responseNorm = responseFlat / globalPeak                               # [B, N] ∈ [0, 1]
-
-    # --- Per-zone peak: true maximum inside each hotspot's Gaussian footprint ---
-    # Hard-threshold the Gaussian at 0.5 → binary footprint within ~1.18σ of centre.
-    zonePeakList: list[torch.Tensor] = []
-    for k in range(hotspots.shape[0]):
-        latDiff = searchLat - hotspots[k, 0]
-        lonDiff = searchLon - hotspots[k, 1]
-        dist2 = latDiff.square() + lonDiff.square()
-        gaussian = torch.exp(-0.5 * dist2 / (hotspot_sigma ** 2))   # [N] ∈ [0, 1]
-        zoneMask = (gaussian > 0.5).to(responseNorm.dtype)           # binary [N]
-        zonePeak = (responseNorm * zoneMask.unsqueeze(0)).amax(dim=-1)   # [B]
-        zonePeakList.append(zonePeak)
-
-    # Reference: weakest beam peak across all zones
-    minZonePeak = torch.stack(zonePeakList, dim=-1).min(dim=-1).values  # [B]
-
-    # --- Peak sidelobe: true maximum outside the importance-weighted region ---
-    outsidePeak = (responseNorm * outsideMask.unsqueeze(0)).amax(dim=-1)  # [B] ∈ [0, 1]
-
-    # --- Bounded PSL ratio ∈ [0, 1] ---
-    # Using the sum in the denominator avoids blow-up when minZonePeak is small.
-    denom = (minZonePeak + outsidePeak).clamp_min(eps)
-    pslRatio = outsidePeak / denom                            # [B] ∈ [0, 1]
-    loss = torch.relu(pslRatio - sidelobe_floor)             # [B] ∈ [0, 1]
-
-    return loss
-
-
-# ---------------------------------------------------------------------------
-# Term 4: Wide-Area Spill
-# ---------------------------------------------------------------------------
-
-
-def wideAreaSpillLoss(
+def _wideAreaResponse(
     batch: ArrayBatch,
-    searchAZEL: tuple[torch.Tensor, torch.Tensor],
-    grid_size: int = 128,
-    padding: float = 0.0,
+    gridSize: int,
+    chunkSize: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    wideAZGrid, wideELGrid = _getWideGrid(batch.device, batch.dtype, gridSize)
+    wideResponse = arrayResponseBatch(batch, (wideAZGrid, wideELGrid), chunkSize=chunkSize)
+    return wideResponse, wideAZGrid, wideELGrid
+
+
+def _rowsAreIdentical(tensor: torch.Tensor) -> bool:
+    if tensor.shape[0] <= 1:
+        return True
+    return bool(torch.equal(tensor, tensor[:1].expand_as(tensor)))
+
+
+def _canUseSharedTargetFastPath(batch: ArrayBatch, prep: TargetPrep) -> bool:
+    if prep.targetECEF is None:
+        return False
+    return (
+        _rowsAreIdentical(batch.LLAPosition)
+        and _rowsAreIdentical(batch.ECEFPosition)
+        and _rowsAreIdentical(batch.elementLocalPosition)
+        and _rowsAreIdentical(batch.gain)
+    )
+
+
+def _sharedTargetAZELForHomogeneousBatch(
+    batch: ArrayBatch,
+    prep: TargetPrep,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert prep.targetECEF is not None
+
+    rotationMatrix = getECEFtoENUMapping(batch.LLAPosition[:1])
+    directionVector = prep.targetECEF.unsqueeze(0) - batch.ECEFPosition[:1, None, :]
+    east, north, up = torch.einsum("bij,bpj->bpi", rotationMatrix, directionVector).unbind(dim=-1)
+    x, y, z = -up, east, north
+
+    azimuth = torch.atan2(y, x).reshape(-1)
+    rho = torch.hypot(x, y).clamp_min(1e-12)
+    elevation = torch.atan2(z, rho).reshape(-1)
+    return azimuth, elevation
+
+
+def _rasterizeWideSupportMask(
+    targetAZEL: tuple[torch.Tensor, torch.Tensor],
+    prep: TargetPrep,
+    wideAZGrid: torch.Tensor,
+    wideELGrid: torch.Tensor,
+    dilationCells: int,
+) -> torch.Tensor:
+    flatAZ, flatEL = targetAZEL
+    batchSize = flatAZ.shape[0]
+    gridSizeAZ, gridSizeEL = wideAZGrid.shape
+    supportMask = torch.zeros(
+        (batchSize, gridSizeAZ, gridSizeEL),
+        device=flatAZ.device,
+        dtype=torch.bool,
+    )
+
+    azMin = wideAZGrid[0, 0]
+    azMax = wideAZGrid[-1, 0]
+    elMin = wideELGrid[0, 0]
+    elMax = wideELGrid[0, -1]
+    azScale = (gridSizeAZ - 1) / (azMax - azMin).clamp_min(torch.finfo(flatAZ.dtype).eps)
+    elScale = (gridSizeEL - 1) / (elMax - elMin).clamp_min(torch.finfo(flatEL.dtype).eps)
+
+    azIdx = ((flatAZ - azMin) * azScale).round().long().clamp(0, gridSizeAZ - 1)
+    elIdx = ((flatEL - elMin) * elScale).round().long().clamp(0, gridSizeEL - 1)
+
+    validMask = (
+        prep.importanceFlat.expand_as(flatAZ) > 0
+    ) & torch.isfinite(flatAZ) & torch.isfinite(flatEL)
+
+    if validMask.any():
+        sampleIdx = torch.arange(batchSize, device=flatAZ.device).unsqueeze(1).expand_as(validMask)
+        supportMask[
+            sampleIdx[validMask],
+            azIdx[validMask],
+            elIdx[validMask],
+        ] = True
+
+    if dilationCells > 0:
+        kernelSize = 2 * dilationCells + 1
+        supportMask = F.max_pool2d(
+            supportMask.unsqueeze(1).to(dtype=wideAZGrid.dtype),
+            kernel_size=kernelSize,
+            stride=1,
+            padding=dilationCells,
+        ).squeeze(1) > 0
+
+    return supportMask
+
+
+def _wideSupportLossFromResponse(
+    wideResponse: torch.Tensor,
+    globalPeak: torch.Tensor,
+    supportMask: torch.Tensor,
     eps: float = 1e-10,
 ) -> torch.Tensor:
-    """Penalise power radiated outside the search area on a full AZ/EL hemisphere scan.
-
-    Scans the complete sphere AZ ∈ [-π, π], EL ∈ [-π/2, π/2] at coarse resolution
-    to detect out-of-window spill that the PSL term (which only looks inside the
-    search window) cannot see.
-
-    The inside mask is **per-batch**: each array sample has a different pose, so the
-    search area occupies different AZ/EL cells for each.  We compute the AZ/EL bounding
-    box of the search area for each sample from the pre-computed *searchAZEL* tensors.
-
-    Args:
-        batch:      ArrayBatch of candidate configurations
-        searchAZEL: (azimuth [B, N], elevation [B, N]) of the search-area points,
-                    already computed by mapLLAtoArrayAZEL.  Passed in to avoid
-                    redundant computation.
-        grid_size:  Side length of the full-sphere scan grid (grid_size² total points).
-                    128 → 16384 pts; 256 → 65536 pts.
-        padding:    Extra margin (radians) added to the search area AZ/EL bounding box
-                    before classifying cells as "inside".  Use this to give the beam's
-                    near-field rolloff room to breathe without being penalised.
-                    0.0 = strict search area boundary.
-
-    Returns:
-        [B] loss ∈ [0, 1] — lower is better.
-    """
-    B = batch.batchSize
-    device = batch.elementLocalPosition.device
-    dtype = batch.elementLocalPosition.dtype
-
-    # --- Full-sphere AZ/EL grid (shared, not batched) ---
-    wideAZ  = torch.linspace(-torch.pi, torch.pi,       grid_size, device=device, dtype=dtype)  # [G]
-    wideEL  = torch.linspace(-torch.pi / 2, torch.pi / 2, grid_size, device=device, dtype=dtype)  # [G]
-    wideAZgrid, wideELgrid = torch.meshgrid(wideAZ, wideEL, indexing="ij")  # [G, G]
-    wideAZflat = wideAZgrid.reshape(-1)  # [G²]
-    wideELflat = wideELgrid.reshape(-1)  # [G²]
-
-    # --- Per-batch inside mask from search area AZ/EL bounding box ---
-    searchAZ, searchEL = searchAZEL              # each [B, N]
-    azMin = searchAZ.min(dim=-1).values - padding  # [B]
-    azMax = searchAZ.max(dim=-1).values + padding  # [B]
-    elMin = searchEL.min(dim=-1).values - padding  # [B]
-    elMax = searchEL.max(dim=-1).values + padding  # [B]
-
-    # Broadcast: [B, 1] vs [G²] → [B, G²]
-    inAZ = (wideAZflat.unsqueeze(0) >= azMin.unsqueeze(1)) & \
-           (wideAZflat.unsqueeze(0) <= azMax.unsqueeze(1))
-    inEL = (wideELflat.unsqueeze(0) >= elMin.unsqueeze(1)) & \
-           (wideELflat.unsqueeze(0) <= elMax.unsqueeze(1))
-    insideMask = (inAZ & inEL).to(dtype)         # [B, G²]
-
-    # --- Full-sphere response: pass shared [G, G] grid directly ---
-    wideResponse = arrayResponseBatch(batch, (wideAZgrid, wideELgrid))  # [B, G, G]
-    wideFlat = wideResponse.flatten(1)                                    # [B, G²]
-
-    # --- Bounded spill ratio ∈ [0, 1] ---
-    insidePower  = (wideFlat * insideMask).sum(dim=-1)              # [B]
-    outsidePower = (wideFlat * (1.0 - insideMask)).sum(dim=-1)      # [B]
-    return outsidePower / (insidePower + outsidePower).clamp_min(eps)  # [B]
+    normalizedResponse = wideResponse / globalPeak.view(-1, 1, 1).clamp_min(eps)
+    outsideMask = (~supportMask).to(dtype=wideResponse.dtype)
+    outsideCount = outsideMask.sum(dim=(1, 2)).clamp_min(1.0)
+    outsideEnergy = (normalizedResponse.square() * outsideMask).sum(dim=(1, 2))
+    return outsideEnergy / outsideCount
 
 
-# ---------------------------------------------------------------------------
-# Combined batch loss
-# ---------------------------------------------------------------------------
+def evaluateBatch(
+    batch: ArrayBatch,
+    target: TargetLike,
+    params: LossConfig,
+    targetMode: TargetMode = "auto",
+    logTerms: bool = False,
+    linearResponseChunkSize: int | None = None,
+    wideResponseChunkSize: int | None = None,
+    responseChunkShapeStrategy: ChunkShapeStrategy = "balanced",
+    responseReductionTileCap: int = 256,
+    allowSharedTargetFastPath: bool = True,
+) -> BatchEvaluation:
+    nvtxEnabled = batch.device.type == "cuda"
+    with nvtx_range(EVALUATE_TOTAL_RANGE, enabled=nvtxEnabled):
+        totalStart = time.perf_counter()
+        if nvtxEnabled:
+            torch.cuda.reset_peak_memory_stats(batch.device)
+
+        resolvedMode = _resolveTargetMode(target, targetMode)
+        target = target.to(batch.device, batch.dtype)
+        prep = _prepareTarget(target, params, resolvedMode)
+
+        linearGridSize = int(prep.powerFlat.shape[-1])
+        resolvedLinearChunkSize = resolveResponseChunkSize(
+            batchSize=batch.batchSize,
+            elementCount=batch.N,
+            gridSize=linearGridSize,
+            realDtype=batch.dtype,
+            device=batch.device,
+            requestedChunkSize=linearResponseChunkSize,
+        )
+        resolvedWideChunkSize = resolveResponseChunkSize(
+            batchSize=batch.batchSize,
+            elementCount=batch.N,
+            gridSize=int(params.wide_grid_size * params.wide_grid_size),
+            realDtype=batch.dtype,
+            device=batch.device,
+            requestedChunkSize=wideResponseChunkSize,
+        )
+
+        usedSharedTargetFastPath = False
+        projectionStart = time.perf_counter()
+        with nvtx_range(EVALUATE_TARGET_PROJECTION_RANGE, enabled=nvtxEnabled):
+            if (
+                allowSharedTargetFastPath
+                and resolvedMode == "shared"
+                and _canUseSharedTargetFastPath(batch, prep)
+            ):
+                sharedAZ, sharedEL = _sharedTargetAZELForHomogeneousBatch(batch, prep)
+                targetAZEL = (
+                    sharedAZ.unsqueeze(0).expand(batch.batchSize, -1),
+                    sharedEL.unsqueeze(0).expand(batch.batchSize, -1),
+                )
+                linearResponseInput = (sharedAZ, sharedEL)
+                usedSharedTargetFastPath = True
+            else:
+                targetAZEL = mapLLAtoArrayAZEL(batch, prep.targetCoordinates)
+                linearResponseInput = targetAZEL
+        targetProjectionMS = (time.perf_counter() - projectionStart) * 1000.0
+
+        with useChunkShapeStrategy(
+            responseChunkShapeStrategy,
+            reductionTileCap=responseReductionTileCap,
+        ):
+            linearResponseStart = time.perf_counter()
+            with nvtx_range(EVALUATE_LINEAR_RESPONSE_RANGE, enabled=nvtxEnabled):
+                linearResponse = arrayResponseBatch(
+                    batch,
+                    linearResponseInput,
+                    chunkSize=resolvedLinearChunkSize,
+                ).reshape(batch.batchSize, *prep.targetShape)
+            linearResponseMS = (time.perf_counter() - linearResponseStart) * 1000.0
+
+            wideResponseStart = time.perf_counter()
+            with nvtx_range(EVALUATE_WIDE_RESPONSE_RANGE, enabled=nvtxEnabled):
+                wideResponse, wideAZGrid, wideELGrid = _wideAreaResponse(
+                    batch,
+                    gridSize=params.wide_grid_size,
+                    chunkSize=resolvedWideChunkSize,
+                )
+            wideResponseMS = (time.perf_counter() - wideResponseStart) * 1000.0
+
+        supportMaskStart = time.perf_counter()
+        with nvtx_range(EVALUATE_SUPPORT_MASK_RANGE, enabled=nvtxEnabled):
+            if usedSharedTargetFastPath:
+                sharedSupportMask = _rasterizeWideSupportMask(
+                    targetAZEL=(targetAZEL[0][:1], targetAZEL[1][:1]),
+                    prep=prep,
+                    wideAZGrid=wideAZGrid,
+                    wideELGrid=wideELGrid,
+                    dilationCells=params.wide_support_dilation_cells,
+                )
+                wideSupportMask = sharedSupportMask.expand(batch.batchSize, -1, -1)
+            else:
+                wideSupportMask = _rasterizeWideSupportMask(
+                    targetAZEL=targetAZEL,
+                    prep=prep,
+                    wideAZGrid=wideAZGrid,
+                    wideELGrid=wideELGrid,
+                    dilationCells=params.wide_support_dilation_cells,
+                )
+        supportMaskMS = (time.perf_counter() - supportMaskStart) * 1000.0
+
+        with nvtx_range(EVALUATE_LOSS_ASSEMBLY_RANGE, enabled=nvtxEnabled):
+            globalPeak = wideResponse.flatten(1).amax(dim=-1).clamp_min(1e-10)
+            normalizedShapeResponse = linearResponse / globalPeak.view(
+                batch.batchSize, *([1] * len(prep.targetShape))
+            )
+
+            shapeLoss = _shapeFidelityLoss(normalizedShapeResponse, prep)
+            efficiencyLoss = _powerEfficiencyLoss(linearResponse, prep)
+            wideSupportLoss = _wideSupportLossFromResponse(
+                wideResponse=wideResponse,
+                globalPeak=globalPeak,
+                supportMask=wideSupportMask,
+            )
+            totalLoss = (
+                params.w_shape * shapeLoss
+                + params.w_eff * efficiencyLoss
+                + params.w_wide * wideSupportLoss
+            )
+
+        if logTerms:
+            print(
+                f"shape={params.w_shape * shapeLoss.mean().item():.4f} | "
+                f"efficiency={params.w_eff * efficiencyLoss.mean().item():.4f} | "
+                f"wide={params.w_wide * wideSupportLoss.mean().item():.4f}"
+            )
+
+        gpuMaxMemoryMB = None
+        if nvtxEnabled:
+            gpuMaxMemoryMB = torch.cuda.max_memory_allocated(batch.device) / (1024**2)
+
+        return BatchEvaluation(
+            totalLoss=totalLoss,
+            shapeLoss=shapeLoss,
+            efficiencyLoss=efficiencyLoss,
+            wideSupportLoss=wideSupportLoss,
+            linearResponse=linearResponse,
+            targetAZEL=targetAZEL,
+            targetMode=resolvedMode,
+            diagnostics=EvaluationDiagnostics(
+                targetProjectionMS=targetProjectionMS,
+                linearResponseMS=linearResponseMS,
+                wideResponseMS=wideResponseMS,
+                supportMaskMS=supportMaskMS,
+                totalMS=(time.perf_counter() - totalStart) * 1000.0,
+                gpuMaxMemoryMB=gpuMaxMemoryMB,
+                usedSharedTargetFastPath=usedSharedTargetFastPath,
+                linearResponseChunkSize=resolvedLinearChunkSize,
+                wideResponseChunkSize=resolvedWideChunkSize,
+            ),
+        )
 
 
 def batchLoss(
     batch: ArrayBatch,
-    target: TargetSpec,
+    target: TargetLike,
     params: LossConfig,
-    lossType: LossType = "MSE",  # unused; kept for API compatibility
+    lossType: LossType = "MSE",
     logTerms: bool = False,
+    targetMode: TargetMode = "auto",
+    linearResponseChunkSize: int | None = None,
+    wideResponseChunkSize: int | None = None,
+    responseChunkShapeStrategy: ChunkShapeStrategy = "balanced",
+    responseReductionTileCap: int = 256,
+    allowSharedTargetFastPath: bool = True,
 ) -> torch.Tensor:
-    """Evaluate the 4-term beamforming loss for a batch of array configurations.
-
-    Args:
-        batch:    ArrayBatch of candidate phased-array weight configurations
-        target:   TargetSpec defining the desired beam pattern
-        params:   LossConfig with per-term weights and hyperparameters
-        lossType: legacy argument — ignored
-        logTerms: if True, print per-term contributions for debugging
-
-    Returns:
-        [B] scalar loss — lower is better
-    """
-    target = target.to(batch.device, batch.dtype)
-    targetAZEL = mapLLAtoArrayAZEL(batch, target.targetCoordinates)
-    linearResponse = arrayResponseBatch(batch, targetAZEL)  # [B, H, W] linear power
-
-    shapeTerm = shapeFidelityLoss(linearResponse, target, alpha=params.alpha)
-    effTerm = powerEfficiencyLoss(linearResponse, target)
-    pslTerm = peakSidelobeLoss(
-        linearResponse,
-        target,
-        sidelobe_floor=params.sidelobe_floor,
-        hotspot_sigma=params.hotspot_sigma,
-    )
-    wideTerm = wideAreaSpillLoss(
-        batch,
-        searchAZEL=targetAZEL,
-        grid_size=params.wide_grid_size,
-        padding=params.wide_padding,
-    )
-
-    if logTerms:
-        print(
-            f"shape={params.w_shape * shapeTerm.mean().item():.4f} | "
-            f"efficiency={params.w_eff * effTerm.mean().item():.4f} | "
-            f"psl={params.w_psl * pslTerm.mean().item():.4f} | "
-            f"wide={params.w_wide * wideTerm.mean().item():.4f}"
-        )
-
-    loss = (
-        params.w_shape * shapeTerm
-        + params.w_eff * effTerm
-        + params.w_psl * pslTerm
-        + params.w_wide * wideTerm
-    )
-    return loss
+    del lossType
+    return evaluateBatch(
+        batch=batch,
+        target=target,
+        params=params,
+        targetMode=targetMode,
+        logTerms=logTerms,
+        linearResponseChunkSize=linearResponseChunkSize,
+        wideResponseChunkSize=wideResponseChunkSize,
+        responseChunkShapeStrategy=responseChunkShapeStrategy,
+        responseReductionTileCap=responseReductionTileCap,
+        allowSharedTargetFastPath=allowSharedTargetFastPath,
+    ).totalLoss

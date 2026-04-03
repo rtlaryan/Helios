@@ -6,7 +6,7 @@ import torch
 from .arrayBatch import ArrayBatch
 from .arraySimulation import arrayResponseBatch, arrayResponseSample, normalizePower, todB
 from .coordinateTransforms import mapLLAtoArrayAZEL
-from .targetSpec import TargetSpec
+from .targetSpec import TargetLike, fetchTargetSample
 
 
 def _render_figure(fig) -> None:
@@ -197,31 +197,37 @@ def plotArrayFactor(
 
 def projectResponseOnTarget(
     batch: ArrayBatch,
-    target: TargetSpec,
+    target: TargetLike,
     sampleID: int = 0,
     normalizedInputs: bool = False,
+    responseTensor: torch.Tensor | None = None,
 ):
-    target = target.to(batch.device, batch.dtype)
-    targetAZEL = mapLLAtoArrayAZEL(batch, target.targetCoordinates)
+    sampleBatch = batch.fetch(sampleID)
+    sampleTarget = fetchTargetSample(target, sampleID).to(batch.device, batch.dtype)
 
-    batchResponse = arrayResponseBatch(batch, targetAZEL, dB=False, normalize=False)
+    if responseTensor is None:
+        targetAZEL = mapLLAtoArrayAZEL(sampleBatch, sampleTarget.targetCoordinates)
+        batchResponse = arrayResponseBatch(sampleBatch, targetAZEL, dB=False, normalize=False)
+        responseTensor = batchResponse[0]
+
+    if responseTensor.shape != sampleTarget.targetShape:
+        responseTensor = responseTensor.reshape(sampleTarget.targetShape)
+
     if normalizedInputs:
-        targetPowerTensor = todB(target.powerMap.clamp_min(1e-12))
-        responseTensor = todB(normalizePower(batchResponse))
+        targetPowerTensor = todB(sampleTarget.powerMap.clamp_min(1e-12))
+        responseDB = todB(normalizePower(responseTensor.unsqueeze(0)))[0]
     else:
-        targetPowerTensor = target.powerMap
-        responseTensor = todB(normalizePower(batchResponse))
-
-    responseDB = responseTensor.reshape(batch.batchSize, *target.targetShape)
+        targetPowerTensor = sampleTarget.powerMap
+        responseDB = todB(normalizePower(responseTensor.unsqueeze(0)))[0]
 
     targetPower = targetPowerTensor.detach().cpu().numpy()
-    responsePower = responseDB[sampleID].detach().cpu().numpy()
+    responsePower = responseDB.detach().cpu().numpy()
     errorPower = responsePower - targetPower
-    latitudes = target.searchLatitudes.detach().cpu().numpy()
-    longitudes = target.searchLongitudes.detach().cpu().numpy()
+    latitudes = sampleTarget.searchLatitudes.detach().cpu().numpy()
+    longitudes = sampleTarget.searchLongitudes.detach().cpu().numpy()
 
-    vmin = min(float(targetPowerTensor.min().item()), float(responseDB[sampleID].min().item()))
-    vmax = max(float(targetPowerTensor.max().item()), float(responseDB[sampleID].max().item()))
+    vmin = min(float(targetPowerTensor.min().item()), float(responseDB.min().item()))
+    vmax = max(float(targetPowerTensor.max().item()), float(responseDB.max().item()))
     errorLimit = max(abs(float(errorPower.min())), abs(float(errorPower.max())), 1e-6)
     powerLabel = "Normalized Power (dB)" if normalizedInputs else "Power (dB)"
     targetTitle = (

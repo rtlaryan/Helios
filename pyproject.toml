@@ -3,6 +3,9 @@ name = "helios"
 version = "0.1.0"
 description = "RL + DL - based phased array beamforming research framework"
 requires-python = ">=3.12"
+dependencies = [
+    "PyYAML>=6.0",
+]
 
 # -------------------------
 # Ruff (lint + format)

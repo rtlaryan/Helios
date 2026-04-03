@@ -1,6 +1,56 @@
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Literal
+
 import torch
 
 from .arrayBatch import ArrayBatch
+
+ChunkShapeStrategy = Literal["balanced", "cap_reduction", "grid_first"]
+
+DEFAULT_CHUNK_SHAPE_STRATEGY: ChunkShapeStrategy = "balanced"
+DEFAULT_REDUCTION_TILE_CAP = 256
+
+_ACTIVE_CHUNK_SHAPE_STRATEGY: ChunkShapeStrategy = DEFAULT_CHUNK_SHAPE_STRATEGY
+_ACTIVE_REDUCTION_TILE_CAP = DEFAULT_REDUCTION_TILE_CAP
+
+
+def _validateReductionTileCap(reductionTileCap: int) -> int:
+    reductionTileCap = int(reductionTileCap)
+    if reductionTileCap <= 0:
+        raise ValueError("reductionTileCap must be positive")
+    return reductionTileCap
+
+
+def getChunkShapeStrategy() -> tuple[ChunkShapeStrategy, int]:
+    return _ACTIVE_CHUNK_SHAPE_STRATEGY, _ACTIVE_REDUCTION_TILE_CAP
+
+
+def setChunkShapeStrategy(
+    strategy: ChunkShapeStrategy,
+    *,
+    reductionTileCap: int = DEFAULT_REDUCTION_TILE_CAP,
+) -> None:
+    global _ACTIVE_CHUNK_SHAPE_STRATEGY, _ACTIVE_REDUCTION_TILE_CAP
+    _ACTIVE_CHUNK_SHAPE_STRATEGY = strategy
+    _ACTIVE_REDUCTION_TILE_CAP = _validateReductionTileCap(reductionTileCap)
+
+
+@contextmanager
+def useChunkShapeStrategy(
+    strategy: ChunkShapeStrategy,
+    *,
+    reductionTileCap: int = DEFAULT_REDUCTION_TILE_CAP,
+) -> Iterator[None]:
+    previousStrategy, previousReductionTileCap = getChunkShapeStrategy()
+    setChunkShapeStrategy(strategy, reductionTileCap=reductionTileCap)
+    try:
+        yield
+    finally:
+        setChunkShapeStrategy(
+            previousStrategy,
+            reductionTileCap=previousReductionTileCap,
+        )
 
 
 def precomputeGridWaveVector(
@@ -66,24 +116,93 @@ def ensureBatchedGrid(
     return azimuth, elevation
 
 
+def resolveResponseChunkSize(
+    batchSize: int,
+    elementCount: int,
+    gridSize: int,
+    realDtype: torch.dtype,
+    device: torch.device,
+    requestedChunkSize: int | None = None,
+) -> int:
+    batchSize = int(batchSize)
+    elementCount = int(elementCount)
+    gridSize = int(gridSize)
+    fullProduct = max(1, batchSize * elementCount * max(1, gridSize))
+    if requestedChunkSize is not None:
+        requestedChunkSize = int(requestedChunkSize)
+        if requestedChunkSize <= 0:
+            raise ValueError("chunkSize must be positive")
+        return int(min(fullProduct, requestedChunkSize))
+
+    if device.type != "cuda":
+        defaultProduct = max(
+            1,
+            batchSize * max(1, min(elementCount, 512)) * max(1, min(gridSize, 512)),
+        )
+        return int(min(fullProduct, defaultProduct))
+
+    try:
+        freeBytes, _totalBytes = torch.cuda.mem_get_info(device)
+    except RuntimeError:
+        freeBytes = 512 * 1024 * 1024
+
+    budgetFloorBytes = 128 * 1024 * 1024
+    budgetCapBytes = 1536 * 1024 * 1024
+    budgetBytes = int(min(budgetCapBytes, max(budgetFloorBytes, freeBytes * 0.10)))
+
+    realBytes = torch.finfo(realDtype).bits // 8
+    bytesPerTriplet = max(1, realBytes * 8)
+    autoChunkSize = max(1, budgetBytes // bytesPerTriplet)
+    return int(min(fullProduct, autoChunkSize))
+
+
 def chooseChunkShape(
     batchRemaining: int,
     elementCount: int,
     gridRemaining: int,
     chunkSize: int,
+    strategy: ChunkShapeStrategy | None = None,
+    reductionTileCap: int | None = None,
 ) -> tuple[int, int, int]:
     """
     Choose (Bc, Nc, Pc) such that Bc * Nc * Pc <= chunkSize.
     """
+    batchRemaining = int(batchRemaining)
+    elementCount = int(elementCount)
+    gridRemaining = int(gridRemaining)
+    chunkSize = int(chunkSize)
     if chunkSize <= 0:
         raise ValueError("chunkSize must be positive")
+    strategy = _ACTIVE_CHUNK_SHAPE_STRATEGY if strategy is None else strategy
+    reductionTileCap = (
+        _ACTIVE_REDUCTION_TILE_CAP if reductionTileCap is None else reductionTileCap
+    )
+    reductionTileCap = _validateReductionTileCap(reductionTileCap)
 
-    bc = min(batchRemaining, max(1, int(round(chunkSize ** (1 / 3)))))
-    pc = min(gridRemaining, max(1, int(round((chunkSize / bc) ** 0.5))))
-    nc = min(elementCount, max(1, chunkSize // (bc * pc)))
-    pc = min(gridRemaining, max(1, chunkSize // (bc * nc)))
+    def _balanced_shape() -> tuple[int, int, int]:
+        bc = min(batchRemaining, max(1, int(round(chunkSize ** (1 / 3)))))
+        pc = min(gridRemaining, max(1, int(round((chunkSize / bc) ** 0.5))))
+        nc = min(elementCount, max(1, chunkSize // (bc * pc)))
+        pc = min(gridRemaining, max(1, chunkSize // (bc * nc)))
+        return bc, nc, pc
 
-    return bc, nc, pc
+    if strategy == "balanced":
+        return _balanced_shape()
+
+    if strategy == "cap_reduction":
+        bc, nc, pc = _balanced_shape()
+        nc = min(nc, elementCount, reductionTileCap)
+        pc = min(gridRemaining, max(1, chunkSize // (bc * nc)))
+        return bc, nc, pc
+
+    if strategy == "grid_first":
+        nc = min(elementCount, reductionTileCap, chunkSize)
+        pc = min(gridRemaining, max(1, int(round((chunkSize / nc) ** 0.5))))
+        bc = min(batchRemaining, max(1, chunkSize // (nc * pc)))
+        pc = min(gridRemaining, max(1, chunkSize // (bc * nc)))
+        return bc, nc, pc
+
+    raise ValueError(f"unknown chunk shape strategy: {strategy}")
 
 
 def arrayResponseCoreOLD(
@@ -158,7 +277,7 @@ def arrayResponseCoreOLD(
     return fullResponse
 
 
-def arrayResponseCore(
+def _arrayResponseCoreReference(
     elementLocalPosition: torch.Tensor,
     weights: torch.Tensor,
     wavelength: float,
@@ -171,10 +290,11 @@ def arrayResponseCore(
     clearCache: bool = False,
 ) -> torch.Tensor:
     """
+    Frozen reference implementation used as the ground truth for parity tests.
     elementLocalPosition: [B, 3, N]
     weights: [B, N]
     gain: [B]
-    azimuth/elevation: [B, ...]
+    azimuth/elevation: [B, ...] or shared [...]
 
     chunkSize controls the dominant temporary:
       [Bc, Nc, Pc]
@@ -182,23 +302,33 @@ def arrayResponseCore(
     batchSize = elementLocalPosition.shape[0]
     elementCount = elementLocalPosition.shape[-1]
     device = weights.device
-    real_dtype = weights.real.dtype
-    complex_dtype = weights.dtype
+    realDtype = weights.real.dtype
+    complexDtype = weights.dtype
 
     waveVector, gridShape = precomputeGridWaveVector(wavelength, azimuth, elevation)
-    spatialShape = gridShape[1:]
-    waveVectorFlat = waveVector.reshape(batchSize, -1, 3).transpose(1, 2)  # [B, 3, P]
+    isBatchedGrid = waveVector.ndim >= 2 and waveVector.shape[0] == batchSize
+    spatialShape = gridShape[1:] if isBatchedGrid else gridShape
+    waveVectorFlat = (
+        waveVector.reshape(batchSize, -1, 3).transpose(1, 2)
+        if isBatchedGrid
+        else waveVector.reshape(-1, 3).transpose(0, 1)
+    )
     gridSize = waveVectorFlat.shape[-1]
 
     weightsConj = weights.conj()
-
-    if chunkSize is None:
-        chunkSize = max(1, batchSize * elementCount * min(gridSize, 1024))
+    chunkSize = resolveResponseChunkSize(
+        batchSize=batchSize,
+        elementCount=elementCount,
+        gridSize=gridSize,
+        realDtype=realDtype,
+        device=device,
+        requestedChunkSize=chunkSize,
+    )
 
     fullResponse = torch.empty(
         (batchSize, *spatialShape),
         device=device,
-        dtype=real_dtype,
+        dtype=realDtype,
     )
 
     bStart = 0
@@ -215,12 +345,12 @@ def arrayResponseCore(
 
         posB = elementLocalPosition[bStart:bEnd]  # [Bc, 3, N]
         wB = weightsConj[bStart:bEnd]  # [Bc, N]
-        waveB = waveVectorFlat[bStart:bEnd]  # [Bc, 3, P]
+        waveB = waveVectorFlat[bStart:bEnd] if isBatchedGrid else waveVectorFlat
 
         responseFlatB = torch.empty(
             (bc, gridSize),
             device=device,
-            dtype=complex_dtype,
+            dtype=complexDtype,
         )
 
         pStart = 0
@@ -235,11 +365,11 @@ def arrayResponseCore(
             pEnd = min(gridSize, pStart + pc)
             pc = pEnd - pStart
 
-            waveChunk = waveB[:, :, pStart:pEnd]  # [Bc, 3, Pc]
+            waveChunk = waveB[:, :, pStart:pEnd] if isBatchedGrid else waveB[:, pStart:pEnd]
             responseChunk = torch.zeros(
                 (bc, pc),
                 device=device,
-                dtype=complex_dtype,
+                dtype=complexDtype,
             )
 
             nStart = 0
@@ -249,7 +379,10 @@ def arrayResponseCore(
                 posChunk = posB[:, :, nStart:nEnd]  # [Bc, 3, Nc]
                 wChunk = wB[:, nStart:nEnd]  # [Bc, Nc]
 
-                phaseChunk = torch.einsum("bin,bip->bnp", posChunk, waveChunk)
+                if isBatchedGrid:
+                    phaseChunk = torch.einsum("bin,bip->bnp", posChunk, waveChunk)
+                else:
+                    phaseChunk = torch.einsum("bin,ip->bnp", posChunk, waveChunk)
                 manifoldChunk = torch.exp(1j * phaseChunk)
                 responseChunk += torch.einsum("bn,bnp->bp", wChunk, manifoldChunk)
 
@@ -280,12 +413,146 @@ def arrayResponseCore(
     return fullResponse
 
 
+def arrayResponseCore(
+    elementLocalPosition: torch.Tensor,
+    weights: torch.Tensor,
+    wavelength: float,
+    azimuth: torch.Tensor,
+    elevation: torch.Tensor,
+    gain: torch.Tensor,
+    chunkSize: int | None = 2_000_000,
+    dB: bool = True,
+    normalize: bool = True,
+    clearCache: bool = False,
+) -> torch.Tensor:
+    """
+    elementLocalPosition: [B, 3, N]
+    weights: [B, N]
+    gain: [B]
+    azimuth/elevation: [B, ...] or shared [...]
+
+    chunkSize controls the dominant temporary:
+      [Bc, Nc, Pc]
+    """
+    batchSize = elementLocalPosition.shape[0]
+    elementCount = elementLocalPosition.shape[-1]
+    device = weights.device
+    realDtype = weights.real.dtype
+    complexDtype = weights.dtype
+
+    waveVector, gridShape = precomputeGridWaveVector(wavelength, azimuth, elevation)
+    isBatchedGrid = waveVector.ndim >= 2 and waveVector.shape[0] == batchSize
+    spatialShape = gridShape[1:] if isBatchedGrid else gridShape
+    waveVectorFlat = (
+        waveVector.reshape(batchSize, -1, 3).transpose(1, 2)
+        if isBatchedGrid
+        else waveVector.reshape(-1, 3).transpose(0, 1)
+    )
+    gridSize = waveVectorFlat.shape[-1]
+
+    weightsConj = weights.conj()
+    chunkSize = resolveResponseChunkSize(
+        batchSize=batchSize,
+        elementCount=elementCount,
+        gridSize=gridSize,
+        realDtype=realDtype,
+        device=device,
+        requestedChunkSize=chunkSize,
+    )
+
+    fullResponse = torch.empty(
+        (batchSize, *spatialShape),
+        device=device,
+        dtype=realDtype,
+    )
+    fullResponseFlat = fullResponse.reshape(batchSize, -1)
+
+    bStart = 0
+    while bStart < batchSize:
+        batchRemaining = batchSize - bStart
+        bc, _, pcMax = chooseChunkShape(
+            batchRemaining=batchRemaining,
+            elementCount=elementCount,
+            gridRemaining=gridSize,
+            chunkSize=chunkSize,
+        )
+        bEnd = min(batchSize, bStart + bc)
+        bc = bEnd - bStart
+
+        posB = elementLocalPosition[bStart:bEnd]  # [Bc, 3, N]
+        wB = weightsConj[bStart:bEnd]  # [Bc, N]
+        waveB = waveVectorFlat[bStart:bEnd] if isBatchedGrid else waveVectorFlat
+        fullResponseFlatB = fullResponseFlat[bStart:bEnd]
+
+        # Reuse one complex scratch tile and write real power directly into the output.
+        responseChunkBuffer = torch.empty(
+            (bc, pcMax),
+            device=device,
+            dtype=complexDtype,
+        )
+
+        pStart = 0
+        while pStart < gridSize:
+            gridRemaining = gridSize - pStart
+            _, nc, pc = chooseChunkShape(
+                batchRemaining=bc,
+                elementCount=elementCount,
+                gridRemaining=gridRemaining,
+                chunkSize=chunkSize,
+            )
+            pEnd = min(gridSize, pStart + pc)
+            pc = pEnd - pStart
+
+            waveChunk = waveB[:, :, pStart:pEnd] if isBatchedGrid else waveB[:, pStart:pEnd]
+            responseChunk = responseChunkBuffer[:, :pc]
+            responseChunk.zero_()
+
+            nStart = 0
+            while nStart < elementCount:
+                nEnd = min(elementCount, nStart + nc)
+
+                posChunk = posB[:, :, nStart:nEnd]  # [Bc, 3, Nc]
+                wChunk = wB[:, nStart:nEnd]  # [Bc, Nc]
+
+                if isBatchedGrid:
+                    phaseChunk = torch.einsum("bin,bip->bnp", posChunk, waveChunk)
+                else:
+                    phaseChunk = torch.einsum("bin,ip->bnp", posChunk, waveChunk)
+                manifoldChunk = torch.exp(1j * phaseChunk)
+                responseChunk += torch.einsum("bn,bnp->bp", wChunk, manifoldChunk)
+
+                del posChunk, wChunk, phaseChunk, manifoldChunk
+                nStart = nEnd
+
+            fullResponseFlatB[:, pStart:pEnd] = responseChunk.abs().square()
+            del waveChunk, responseChunk
+            pStart = pEnd
+
+        del posB, wB, waveB, fullResponseFlatB, responseChunkBuffer
+        bStart = bEnd
+
+    del waveVector, waveVectorFlat, weightsConj, fullResponseFlat
+
+    if normalize:
+        fullResponse = normalizePower(fullResponse)
+
+    if dB:
+        gainView = gain.view(-1, *([1] * (fullResponse.ndim - 1)))
+        fullResponse = todB(fullResponse) + gainView
+        del gainView
+
+    if clearCache and device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    return fullResponse
+
+
 def arrayResponseSample(
     batch: ArrayBatch,
     sampleID: int,
     azimuth: torch.Tensor,
     elevation: torch.Tensor,
-    chunkSize: int | None = 2_000_000,
+    chunkSize: int | None = 3_000_000,
     dB: bool = True,
     normalize: bool = True,
 ) -> torch.Tensor:
@@ -309,22 +576,16 @@ def arrayResponseSample(
 def arrayResponseBatch(
     batch: ArrayBatch,
     relativeTargetAZEL: tuple[torch.Tensor, torch.Tensor],
-    chunkSize: int | None = 2_000_000_000,
+    chunkSize: int | None = None,
     dB: bool = False,
     normalize: bool = False,
 ) -> torch.Tensor:
-    azimuth, elevation = ensureBatchedGrid(
-        azimuth=relativeTargetAZEL[0],
-        elevation=relativeTargetAZEL[1],
-        batchSize=batch.batchSize,
-    )
-
     return arrayResponseCore(
         elementLocalPosition=batch.elementLocalPosition,
         weights=batch.weights,
         wavelength=batch.wavelength,
-        azimuth=azimuth,
-        elevation=elevation,
+        azimuth=relativeTargetAZEL[0],
+        elevation=relativeTargetAZEL[1],
         gain=batch.gain,
         chunkSize=chunkSize,
         dB=dB,
