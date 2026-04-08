@@ -6,10 +6,9 @@ import torch
 import torch.nn.functional as F
 from scripts.arrayBatch import ArrayBatch
 from scripts.arraySimulation import (
-    ChunkShapeStrategy,
     arrayResponseBatch,
+    arrayResponseBatchCompiled,
     resolveResponseChunkSize,
-    useChunkShapeStrategy,
 )
 from scripts.coordinateTransforms import LLAtoECEF, getECEFtoENUMapping, mapLLAtoArrayAZEL
 from scripts.targetSpec import TargetBatch, TargetLike, TargetSpec
@@ -226,9 +225,17 @@ def _wideAreaResponse(
     batch: ArrayBatch,
     gridSize: int,
     chunkSize: int | None = None,
+    reductionTileCap: int = 256,
+    useCompiledArrayResponse: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     wideAZGrid, wideELGrid = _getWideGrid(batch.device, batch.dtype, gridSize)
-    wideResponse = arrayResponseBatch(batch, (wideAZGrid, wideELGrid), chunkSize=chunkSize)
+    responseBatchFn = arrayResponseBatchCompiled if useCompiledArrayResponse else arrayResponseBatch
+    wideResponse = responseBatchFn(
+        batch,
+        (wideAZGrid, wideELGrid),
+        chunkSize=chunkSize,
+        reductionTileCap=reductionTileCap,
+    )
     return wideResponse, wideAZGrid, wideELGrid
 
 
@@ -337,8 +344,8 @@ def evaluateBatch(
     logTerms: bool = False,
     linearResponseChunkSize: int | None = None,
     wideResponseChunkSize: int | None = None,
-    responseChunkShapeStrategy: ChunkShapeStrategy = "balanced",
     responseReductionTileCap: int = 256,
+    useCompiledArrayResponse: bool = False,
     allowSharedTargetFastPath: bool = True,
 ) -> BatchEvaluation:
     nvtxEnabled = batch.device.type == "cuda"
@@ -389,27 +396,29 @@ def evaluateBatch(
                 linearResponseInput = targetAZEL
         targetProjectionMS = (time.perf_counter() - projectionStart) * 1000.0
 
-        with useChunkShapeStrategy(
-            responseChunkShapeStrategy,
-            reductionTileCap=responseReductionTileCap,
-        ):
-            linearResponseStart = time.perf_counter()
-            with nvtx_range(EVALUATE_LINEAR_RESPONSE_RANGE, enabled=nvtxEnabled):
-                linearResponse = arrayResponseBatch(
-                    batch,
-                    linearResponseInput,
-                    chunkSize=resolvedLinearChunkSize,
-                ).reshape(batch.batchSize, *prep.targetShape)
-            linearResponseMS = (time.perf_counter() - linearResponseStart) * 1000.0
+        linearResponseStart = time.perf_counter()
+        with nvtx_range(EVALUATE_LINEAR_RESPONSE_RANGE, enabled=nvtxEnabled):
+            responseBatchFn = (
+                arrayResponseBatchCompiled if useCompiledArrayResponse else arrayResponseBatch
+            )
+            linearResponse = responseBatchFn(
+                batch,
+                linearResponseInput,
+                chunkSize=resolvedLinearChunkSize,
+                reductionTileCap=responseReductionTileCap,
+            ).reshape(batch.batchSize, *prep.targetShape)
+        linearResponseMS = (time.perf_counter() - linearResponseStart) * 1000.0
 
-            wideResponseStart = time.perf_counter()
-            with nvtx_range(EVALUATE_WIDE_RESPONSE_RANGE, enabled=nvtxEnabled):
-                wideResponse, wideAZGrid, wideELGrid = _wideAreaResponse(
-                    batch,
-                    gridSize=params.wide_grid_size,
-                    chunkSize=resolvedWideChunkSize,
-                )
-            wideResponseMS = (time.perf_counter() - wideResponseStart) * 1000.0
+        wideResponseStart = time.perf_counter()
+        with nvtx_range(EVALUATE_WIDE_RESPONSE_RANGE, enabled=nvtxEnabled):
+            wideResponse, wideAZGrid, wideELGrid = _wideAreaResponse(
+                batch,
+                gridSize=params.wide_grid_size,
+                chunkSize=resolvedWideChunkSize,
+                reductionTileCap=responseReductionTileCap,
+                useCompiledArrayResponse=useCompiledArrayResponse,
+            )
+        wideResponseMS = (time.perf_counter() - wideResponseStart) * 1000.0
 
         supportMaskStart = time.perf_counter()
         with nvtx_range(EVALUATE_SUPPORT_MASK_RANGE, enabled=nvtxEnabled):
@@ -493,8 +502,8 @@ def batchLoss(
     targetMode: TargetMode = "auto",
     linearResponseChunkSize: int | None = None,
     wideResponseChunkSize: int | None = None,
-    responseChunkShapeStrategy: ChunkShapeStrategy = "balanced",
     responseReductionTileCap: int = 256,
+    useCompiledArrayResponse: bool = False,
     allowSharedTargetFastPath: bool = True,
 ) -> torch.Tensor:
     del lossType
@@ -506,7 +515,7 @@ def batchLoss(
         logTerms=logTerms,
         linearResponseChunkSize=linearResponseChunkSize,
         wideResponseChunkSize=wideResponseChunkSize,
-        responseChunkShapeStrategy=responseChunkShapeStrategy,
         responseReductionTileCap=responseReductionTileCap,
+        useCompiledArrayResponse=useCompiledArrayResponse,
         allowSharedTargetFastPath=allowSharedTargetFastPath,
     ).totalLoss

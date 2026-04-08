@@ -7,8 +7,6 @@ from scripts.arraySimulation import (
     _arrayResponseCoreReference,
     arrayResponseCore,
     chooseChunkShape,
-    getChunkShapeStrategy,
-    useChunkShapeStrategy,
 )
 
 
@@ -107,18 +105,19 @@ def test_array_response_core_matches_reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for parity check")
-def test_array_response_core_matches_reference_on_cuda() -> None:
+@pytest.mark.parametrize("chunk_size", [37, 211], ids=["batch_split", "full_batch"])
+def test_array_response_core_matches_reference_on_cuda(chunk_size: int) -> None:
     inputs = _make_response_inputs(torch.device("cuda"), batched_grid=True)
 
     expected = _arrayResponseCoreReference(
         **inputs,
-        chunkSize=211,
+        chunkSize=chunk_size,
         normalize=True,
         dB=True,
     )
     actual = arrayResponseCore(
         **inputs,
-        chunkSize=211,
+        chunkSize=chunk_size,
         normalize=True,
         dB=True,
     )
@@ -126,29 +125,12 @@ def test_array_response_core_matches_reference_on_cuda() -> None:
     torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
 
 
-def test_choose_chunk_shape_default_matches_balanced_strategy() -> None:
-    defaultShape = chooseChunkShape(50, 50_176, 50_176, 5_000_000)
-    explicitBalancedShape = chooseChunkShape(
-        50,
-        50_176,
-        50_176,
-        5_000_000,
-        strategy="balanced",
-    )
-
-    assert defaultShape == explicitBalancedShape
-
-
-@pytest.mark.parametrize("strategy", ["cap_reduction", "grid_first"])
-def test_choose_chunk_shape_experimental_strategies_respect_limits(
-    strategy: str,
-) -> None:
+def test_choose_chunk_shape_caps_reduction_tile() -> None:
     bc, nc, pc = chooseChunkShape(
         50,
         50_176,
         50_176,
         10_000_000,
-        strategy=strategy,
         reductionTileCap=128,
     )
 
@@ -158,10 +140,31 @@ def test_choose_chunk_shape_experimental_strategies_respect_limits(
     assert bc * nc * pc <= 10_000_000
 
 
-def test_use_chunk_shape_strategy_restores_previous_strategy() -> None:
-    previous = getChunkShapeStrategy()
+def test_choose_chunk_shape_prefers_full_remaining_batch_when_it_fits() -> None:
+    bc, nc, pc = chooseChunkShape(
+        4,
+        16,
+        1_000,
+        512,
+        reductionTileCap=64,
+    )
 
-    with useChunkShapeStrategy("grid_first", reductionTileCap=64):
-        assert getChunkShapeStrategy() == ("grid_first", 64)
+    assert nc == 16
+    assert bc == 4
+    assert pc == 8
+    assert bc * nc * pc <= 512
 
-    assert getChunkShapeStrategy() == previous
+
+def test_choose_chunk_shape_falls_back_to_batch_split_when_needed() -> None:
+    bc, nc, pc = chooseChunkShape(
+        50,
+        1_000,
+        10_000,
+        4_096,
+        reductionTileCap=128,
+    )
+
+    assert nc == 128
+    assert bc < 50
+    assert pc == 1
+    assert bc * nc * pc <= 4_096

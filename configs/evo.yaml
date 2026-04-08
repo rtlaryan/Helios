@@ -1,8 +1,8 @@
 experiment:
-  name: evo_2_multibeam
+  name: evo_3_multibeam
   logDir: data/runs
   archiveDir: data/archive
-  resume: true
+  resume: false
   plotProjection: false
   tensorboard: true
   targetMode: auto
@@ -52,12 +52,11 @@ evolution:
   phaseAdaptiveSigmaFloor: false
   phaseMinSigmaScale: 0.1
   amplitudeMinSigmaScale: 0.1
-  wideGridSizeStart: 64
+  wideGridSizeStart: 128
   wideGridRampSteps: 4000
   linearResponseChunkSize: 400000
   wideResponseChunkSize: 400000
-  responseChunkShapeStrategy: cap_reduction
-  responseReductionTileCap: 2048
+  responseReductionTileCap: 2000
   lossType: HUBER
 
 loss:

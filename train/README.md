@@ -11,7 +11,6 @@ This directory contains the machine learning pipelines for optimizing phased arr
 - `persistence.py`: Async-capable dataset and checkpoint writers.
 - `benchmark_evaluate.py`: Benchmarks evaluation timing/memory with and without the shared-target fast path.
 - `benchmark_chunk_sweep.py`: Sweeps response chunk sizes and measures end-to-end evaluation time for each candidate.
-- `benchmark_chunk_shapes.py`: Compares named chunk-shape heuristics at fixed chunk sizes.
 - `profile_with_nsys.py`: Launches a benchmark under `nsys`, keeps the raw trace, and writes a JSON summary of NVTX-filtered GPU activity.
 
 ## YAML Workflow
@@ -37,7 +36,7 @@ conda run -n helios python -m train.run --config path/to/run.yaml
 `evolution.initialWeightsType` controls how the first population is initialized. Supported values are `random`, `uniform`, and `directed`. When `directed` is used, the training pipeline derives a steering center automatically from the resolved target map.
 
 The trainer now uses a clone/crossover/mutate/random population update. Parent choice is rank-weighted inside the configured parent pool. Random injection decays over time, the released budget is absorbed by mutation, and sigma values use both exponential decay and diversity-aware minimum floors. If progress stalls, the trainer temporarily boosts sigma values and random injection to re-open exploration. `wide_grid_size` can also ramp from a smaller start value to the final loss fidelity for faster early generations.
-Shared-target runs with homogeneous array geometry now reuse target projection/support work across the batch, and response chunk sizes can be capped explicitly or left on a conservative CUDA-aware auto mode.
+Shared-target runs with homogeneous array geometry now reuse target projection/support work across the batch, and response chunk sizes can be capped explicitly or left on a conservative CUDA-aware auto mode. Inside the response kernel, Helios now uses one tiling heuristic: cap the reduction tile with `responseReductionTileCap`, then try to keep the full remaining batch in one tile before growing the grid tile.
 
 To tune chunk sizes on a specific config, run:
 
@@ -57,17 +56,6 @@ conda run -n helios python -m train.profile_with_nsys \
 ```
 
 This keeps `data/profiling/evo_linear.nsys-rep`, the exported SQLite file, and writes `data/profiling/evo_linear_nsys_summary.json`. The chunk sweep and evaluation paths now emit NVTX ranges so `nsys stats --filter-nvtx ...` can isolate full runs, per-chunk candidates, per-iteration evaluations, and the major evaluation stages.
-
-To compare tiling heuristics directly, run:
-
-```bash
-conda run -n helios python -m train.benchmark_chunk_shapes \
-  --config configs/evo.yaml \
-  --sweep linear \
-  --chunk-sizes 1e6 5e6 1e7 \
-  --strategies balanced cap_reduction grid_first \
-  --reduction-tile-cap 256
-```
 
 The profiling history and current chunking conclusions are tracked in `docs/performance/array_response_tiling.md`.
 
@@ -162,8 +150,7 @@ target:
 - `stagnationWindow`, `sigmaBoostDuration`, `sigmaBoostMultiplier`, and `sigmaBoostRandomFraction` control stagnation-triggered exploration boosts.
 - `wideGridSizeStart` and `wideGridRampSteps` optionally ramp wide-angle fidelity from a coarse grid to the final `loss.wide_grid_size`.
 - `linearResponseChunkSize` and `wideResponseChunkSize` optionally cap evaluation chunk sizes. When left unset, Helios chooses conservative CUDA-aware defaults.
-- `responseChunkShapeStrategy` selects the chunk-shape heuristic used inside the response kernel tiling. Supported values are `balanced`, `cap_reduction`, and `grid_first`.
-- `responseReductionTileCap` limits the `Nc` reduction tile used by the reduction-capped chunk-shape strategies.
+- `responseReductionTileCap` limits the `Nc` reduction tile used by the response kernel. Once `Nc` is capped, Helios tries to keep the full remaining batch in one tile and only falls back to batch striping when necessary.
 
 ## Target Config Options
 
@@ -214,6 +201,28 @@ target:
 
 If `references` or `inlineBatch` is used, the resolved target becomes a `TargetBatch`, and its length must match `evolution.batchSize`.
 If `decimate` is greater than `1`, the resolved target is spatially downsampled before training. This is useful when you want to keep a high-quality source target on disk but run faster searches against a coarser grid.
+
+### Per-sample target batch from a manifest
+
+```yaml
+target:
+  manifest: data/targets/sample_corpus/manifest.yaml
+  selection: random_without_replacement
+  selectionSeed: 7
+  decimate: 1
+```
+
+When `manifest` is used, Helios selects `target.selectionCount` samples from the manifest at startup. If `selectionCount` is omitted, it defaults to `evolution.batchSize`.
+
+## Offline Target Corpus Generation
+
+Helios can generate procedural target corpora offline:
+
+```bash
+python -m generation.generate_targets --config configs/target_corpus.yaml
+```
+
+The generator writes one `TargetSpec` `.pt` file per target plus a YAML manifest. Generated corpora default to normalized linear power maps, and the generator config can switch to dB power maps with `grid.powerMode: db`. See [generation/README.md](/home/aryan/projects/Helios/generation/README.md) for the generator-specific workflow.
 
 ## Logging Modes
 

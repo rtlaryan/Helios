@@ -154,7 +154,6 @@ def _run_candidate(
                     targetMode=controller.targetMode,
                     linearResponseChunkSize=linear_chunk_size,
                     wideResponseChunkSize=wide_chunk_size,
-                    responseChunkShapeStrategy=controller.config.responseChunkShapeStrategy,
                     responseReductionTileCap=controller.config.responseReductionTileCap,
                     allowSharedTargetFastPath=allow_shared_target_fast_path,
                 )

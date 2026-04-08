@@ -141,7 +141,6 @@ def test_load_run_config_accepts_crossover_and_scheduler_fields(tmp_path: Path) 
             "wideGridRampSteps": 10,
             "linearResponseChunkSize": 256,
             "wideResponseChunkSize": 128,
-            "responseChunkShapeStrategy": "grid_first",
             "responseReductionTileCap": 2048,
         },
         "logging": {"logMode": "metrics_only"},
@@ -164,10 +163,33 @@ def test_load_run_config_accepts_crossover_and_scheduler_fields(tmp_path: Path) 
     assert runConfig.evolution.wideGridSizeStart == 8
     assert runConfig.evolution.linearResponseChunkSize == 256
     assert runConfig.evolution.wideResponseChunkSize == 128
-    assert runConfig.evolution.responseChunkShapeStrategy == "grid_first"
     assert runConfig.evolution.responseReductionTileCap == 2048
     assert serialized["evolution"]["wideGridRampSteps"] == 10
-    assert serialized["evolution"]["responseChunkShapeStrategy"] == "grid_first"
+    assert serialized["evolution"]["responseReductionTileCap"] == 2048
+    assert "responseChunkShapeStrategy" not in serialized["evolution"]
+
+
+def test_load_run_config_rejects_removed_chunk_shape_strategy(tmp_path: Path) -> None:
+    payload = {
+        "experiment": {"name": "yaml_removed_strategy"},
+        "device": {"device": "cpu", "dtype": "float32"},
+        "array": {"allowedElementCount": [4], "allowedAspectRatio": [1.0]},
+        "evolution": {
+            "batchSize": 4,
+            "evolutionSteps": 3,
+            "responseChunkShapeStrategy": "cap_reduction",
+        },
+        "logging": {"logMode": "metrics_only"},
+        "checkpoint": {"checkpointMode": "off"},
+        "workers": {"asyncIO": False, "datasetWriterWorkers": 0, "checkpointWriterWorkers": 0},
+        "target": {"inline": make_target_inline_payload()},
+    }
+    configPath = tmp_path / "run.yaml"
+    with configPath.open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(payload, handle, sort_keys=False)
+
+    with pytest.raises(ValueError, match="responseChunkShapeStrategy has been removed"):
+        loadRunConfig(configPath)
 
 
 def test_infer_target_center_prefers_weighted_support_centroid() -> None:

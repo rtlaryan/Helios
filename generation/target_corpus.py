@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 import math
+import os
 from pathlib import Path
 import random
 from typing import Any
+import uuid
 
 import torch
 import yaml
@@ -12,8 +15,15 @@ import yaml
 from scripts.target_generation import build_target_maps, build_target_spec
 from scripts.targetSpec import TargetSpec
 
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover
+    tqdm = None
+
+
 CATEGORY_NAMES = ("single_circle", "irregular_shape", "multibeam")
 POWER_MODES = {"normalized", "db"}
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 @dataclass
@@ -81,6 +91,7 @@ class TargetCorpusConfig:
     grid: CorpusGridConfig
     curriculum: CurriculumConfig
     categories: CategoryConfig
+    workers: int | str = 1
 
     @property
     def hotspotCount(self) -> int:
@@ -119,13 +130,13 @@ def _int_range(payload: Any, field_name: str) -> tuple[int, int]:
 
 
 def loadTargetCorpusConfig(path: str | Path) -> TargetCorpusConfig:
-    config_path = Path(path)
-    payload = _load_yaml(config_path)
+    payload = _load_yaml(Path(path))
 
     output_payload = _require_mapping(payload.get("output"), "output")
     grid_payload = _require_mapping(payload.get("grid"), "grid")
     curriculum_payload = _require_mapping(payload.get("curriculum"), "curriculum")
     category_payload = _require_mapping(payload.get("categories"), "categories")
+    curriculum_weights = _require_mapping(curriculum_payload.get("weights"), "curriculum.weights")
 
     output = CorpusOutputConfig(
         root=output_payload.get("root", "data/targets/generated"),
@@ -140,10 +151,7 @@ def loadTargetCorpusConfig(path: str | Path) -> TargetCorpusConfig:
         powerMode=str(grid_payload.get("powerMode", "normalized")),
     )
     curriculum = CurriculumConfig(
-        weights={
-            name: float(_require_mapping(curriculum_payload.get("weights"), "curriculum.weights").get(name, 0.0))
-            for name in CATEGORY_NAMES
-        }
+        weights={name: float(curriculum_weights.get(name, 0.0)) for name in CATEGORY_NAMES}
     )
 
     single_circle_payload = _require_mapping(category_payload.get("single_circle"), "categories.single_circle")
@@ -183,6 +191,7 @@ def loadTargetCorpusConfig(path: str | Path) -> TargetCorpusConfig:
         grid=grid,
         curriculum=curriculum,
         categories=categories,
+        workers=payload.get("workers", 1),
     )
     validateTargetCorpusConfig(config)
     return config
@@ -191,6 +200,11 @@ def loadTargetCorpusConfig(path: str | Path) -> TargetCorpusConfig:
 def validateTargetCorpusConfig(config: TargetCorpusConfig) -> None:
     if config.count <= 0:
         raise ValueError("count must be positive")
+    if isinstance(config.workers, str):
+        if config.workers != "auto":
+            raise ValueError("workers must be a positive integer or 'auto'")
+    elif int(config.workers) <= 0:
+        raise ValueError("workers must be positive")
     if config.grid.resolutionDeg <= 0:
         raise ValueError("grid.resolutionDeg must be positive")
     if config.grid.decimate <= 0:
@@ -209,6 +223,27 @@ def _resolve_path(path_value: str | Path, base_dir: Path) -> Path:
     return path if path.is_absolute() else base_dir / path
 
 
+def _resolve_worker_count(workers: int | str) -> int:
+    if workers == "auto":
+        cpu_count = os.cpu_count() or 1
+        return max(1, cpu_count - 1)
+    return max(1, int(workers))
+
+
+class _NullProgressBar:
+    def update(self, _n: int = 1) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+def _create_progress_bar(*, total: int, enabled: bool, description: str):
+    if not enabled or tqdm is None:
+        return _NullProgressBar()
+    return tqdm(total=total, desc=description, unit="target", dynamic_ncols=True)
+
+
 def _sample_float(value_range: tuple[float, float], rng: random.Random) -> float:
     low, high = value_range
     return low if math.isclose(low, high) else rng.uniform(low, high)
@@ -219,11 +254,7 @@ def _sample_int(value_range: tuple[int, int], rng: random.Random) -> int:
     return low if low == high else rng.randint(low, high)
 
 
-def _sample_center(
-    value_range: tuple[float, float],
-    margin: float,
-    rng: random.Random,
-) -> float:
+def _sample_center(value_range: tuple[float, float], margin: float, rng: random.Random) -> float:
     low, high = value_range
     if high - low <= 2 * margin:
         return rng.uniform(low, high)
@@ -284,12 +315,7 @@ def _sample_polygon_vertices(
         radial_scale = rng.uniform(0.6, 1.0)
         lat = center_lat + math.sin(angle) * radius_deg * radial_scale
         lon = center_lon + (math.cos(angle) * radius_deg * radial_scale) / cos_center
-        vertices.append(
-            {
-                "lat": _clamp(lat, lat_range),
-                "lon": _clamp(lon, lon_range),
-            }
-        )
+        vertices.append({"lat": _clamp(lat, lat_range), "lon": _clamp(lon, lon_range)})
     return vertices
 
 
@@ -341,21 +367,8 @@ def _sample_irregular_zones(
                 ),
             }
 
-        zones.append(
-            {
-                **shape_payload,
-                "type": "power",
-                "rolloff": rolloff,
-                "peak_db": peak_db,
-            }
-        )
-        zones.append(
-            {
-                **shape_payload,
-                "type": "importance",
-                "rolloff": rolloff,
-            }
-        )
+        zones.append({**shape_payload, "type": "power", "rolloff": rolloff, "peak_db": peak_db})
+        zones.append({**shape_payload, "type": "importance", "rolloff": rolloff})
 
     return zones, {
         "componentCount": component_count,
@@ -364,10 +377,7 @@ def _sample_irregular_zones(
     }
 
 
-def _great_circle_like_distance(
-    point_a: tuple[float, float],
-    point_b: tuple[float, float],
-) -> float:
+def _great_circle_like_distance(point_a: tuple[float, float], point_b: tuple[float, float]) -> float:
     mean_lat = math.radians((point_a[0] + point_b[0]) / 2.0)
     dlat = point_a[0] - point_b[0]
     dlon = (point_a[1] - point_b[1]) * math.cos(mean_lat)
@@ -437,7 +447,6 @@ def _allocate_category_counts(total: int, weights: dict[str, float]) -> dict[str
     total_weight = sum(normalized.values())
     if total_weight <= 0:
         raise ValueError("curriculum.weights must contain at least one positive value")
-
     raw = {name: total * normalized[name] / total_weight for name in CATEGORY_NAMES}
     counts = {name: int(math.floor(raw[name])) for name in CATEGORY_NAMES}
     assigned = sum(counts.values())
@@ -486,19 +495,10 @@ def _generate_target_for_category(
         lon_range=config.grid.lonRange,
         normalize=config.grid.powerMode == "normalized",
     )
-    target = build_target_spec(
-        maps,
-        zones,
-        hotspot_count=config.hotspotCount,
-    )
+    target = build_target_spec(maps, zones, hotspot_count=config.hotspotCount)
     if config.grid.decimate > 1:
         target = target.decimate(config.grid.decimate)
-    metadata.update(
-        {
-            "powerMode": config.grid.powerMode,
-            "zoneCount": len(zones),
-        }
-    )
+    metadata.update({"powerMode": config.grid.powerMode, "zoneCount": len(zones)})
     return target, zones, metadata
 
 
@@ -509,40 +509,126 @@ def _record_relative_path(path: Path, manifest_path: Path) -> str:
         return str(path)
 
 
-def generateTargetCorpus(config_path: str | Path) -> dict[str, Any]:
+def _save_target_atomic(target: TargetSpec, target_path: Path) -> None:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = target_path.with_name(f".{target_path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        torch.save(target, temp_path)
+        os.replace(temp_path, target_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+
+
+def _generate_target_payload(
+    *,
+    index: int,
+    category: str,
+    config: TargetCorpusConfig,
+) -> tuple[int, str, TargetSpec, dict[str, Any]]:
+    rng = random.Random(config.seed + index)
+    target, _zones, metadata = _generate_target_for_category(category, config, rng)
+    return index, category, target, metadata
+
+
+def _generate_target_payload_star(
+    args: tuple[int, str, TargetCorpusConfig],
+) -> tuple[int, str, TargetSpec, dict[str, Any]]:
+    index, category, config = args
+    return _generate_target_payload(index=index, category=category, config=config)
+
+
+def _save_generated_target(
+    *,
+    index: int,
+    category: str,
+    target: TargetSpec,
+    metadata: dict[str, Any],
+    output_root: Path,
+    manifest_path: Path,
+    prefix: str,
+) -> dict[str, Any]:
+    target_path = output_root / f"{prefix}_{index:05d}.pt"
+    _save_target_atomic(target, target_path)
+    return {
+        "index": index,
+        "category": category,
+        "path": _record_relative_path(target_path, manifest_path),
+        **metadata,
+    }
+
+
+def generateTargetCorpus(
+    config_path: str | Path,
+    *,
+    workers: int | str | None = None,
+    showProgress: bool = True,
+    progressDescription: str = "Generating targets",
+) -> dict[str, Any]:
     source_path = Path(config_path)
     config = loadTargetCorpusConfig(source_path)
-    base_dir = source_path.parent
-    output_root = _resolve_path(config.output.root, base_dir)
+    if workers is not None:
+        config.workers = workers
+        validateTargetCorpusConfig(config)
+
+    output_root = _resolve_path(config.output.root, PROJECT_ROOT)
     manifest_path = _resolve_path(
         config.output.manifestPath or output_root / "manifest.yaml",
-        base_dir,
+        PROJECT_ROOT,
     )
     output_root.mkdir(parents=True, exist_ok=True)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
-    rng = random.Random(config.seed)
+    schedule_rng = random.Random(config.seed)
     curriculum_counts = _allocate_category_counts(config.count, config.curriculum.weights)
-    schedule = _build_category_schedule(curriculum_counts, rng)
+    schedule = _build_category_schedule(curriculum_counts, schedule_rng)
 
-    records: list[dict[str, Any]] = []
-    for index, category in enumerate(schedule):
-        target, _zones, metadata = _generate_target_for_category(category, config, rng)
-        target_path = output_root / f"{config.output.prefix}_{index:05d}.pt"
-        torch.save(target, target_path)
-        records.append(
-            {
-                "index": index,
-                "category": category,
-                "path": _record_relative_path(target_path, manifest_path),
-                **metadata,
-            }
-        )
+    worker_count = _resolve_worker_count(config.workers)
+    job_args = [(index, category, config) for index, category in enumerate(schedule)]
+    records_by_index: dict[int, dict[str, Any]] = {}
+    progress_bar = _create_progress_bar(
+        total=len(job_args),
+        enabled=showProgress,
+        description=progressDescription,
+    )
+    try:
+        if worker_count == 1:
+            for args in job_args:
+                index, category, target, metadata = _generate_target_payload_star(args)
+                records_by_index[index] = _save_generated_target(
+                    index=index,
+                    category=category,
+                    target=target,
+                    metadata=metadata,
+                    output_root=output_root,
+                    manifest_path=manifest_path,
+                    prefix=config.output.prefix,
+                )
+                progress_bar.update(1)
+        else:
+            with ProcessPoolExecutor(max_workers=worker_count) as executor:
+                futures = [executor.submit(_generate_target_payload_star, args) for args in job_args]
+                for future in as_completed(futures):
+                    index, category, target, metadata = future.result()
+                    records_by_index[index] = _save_generated_target(
+                        index=index,
+                        category=category,
+                        target=target,
+                        metadata=metadata,
+                        output_root=output_root,
+                        manifest_path=manifest_path,
+                        prefix=config.output.prefix,
+                    )
+                    progress_bar.update(1)
+    finally:
+        progress_bar.close()
 
+    records = [records_by_index[index] for index in range(len(job_args))]
     manifest = {
         "version": 1,
         "seed": config.seed,
         "count": config.count,
+        "workers": worker_count,
         "powerMode": config.grid.powerMode,
         "maxHotspots": config.hotspotCount,
         "grid": {

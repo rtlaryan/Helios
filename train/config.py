@@ -3,11 +3,13 @@ from __future__ import annotations
 import re
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
+import random
 from typing import Any, TypeVar
 
 import torch
 import yaml
 from scripts.arraySpec import ArraySpec
+from scripts.target_generation import load_target_from_zones_json
 from scripts.targetSpec import TargetBatch, TargetLike, TargetSpec
 from train.evolve import EvolutionConfig
 from train.objective import LossConfig
@@ -30,9 +32,13 @@ _FLOAT_PATTERN = re.compile(
 class TargetConfig:
     reference: str | None = None
     references: list[str] | None = None
+    manifest: str | None = None
     inline: dict[str, Any] | None = None
     inlineBatch: list[dict[str, Any]] | None = None
     format: str | None = None
+    selection: str = "first"
+    selectionCount: int | None = None
+    selectionSeed: int | None = None
     resolutionDeg: float = 0.5
     decimate: int = 1
 
@@ -106,12 +112,19 @@ def loadRunConfig(path: str | Path) -> RunConfig:
 
 
 def buildRunConfig(payload: dict[str, Any]) -> RunConfig:
+    evolutionPayload = _ensure_dict(payload.get("evolution"), "evolution")
+    if "responseChunkShapeStrategy" in evolutionPayload:
+        raise ValueError(
+            "evolution.responseChunkShapeStrategy has been removed; "
+            "update the config to use responseReductionTileCap only"
+        )
+
     experiment = _coerce_dataclass(ExperimentConfig, _ensure_dict(payload.get("experiment"), "experiment"))
     device = _coerce_dataclass(DeviceConfig, _ensure_dict(payload.get("device"), "device"))
     array = _coerce_dataclass(ArraySpec, _ensure_dict(payload.get("array"), "array"))
     evolution = _coerce_dataclass(
         EvolutionConfig,
-        _ensure_dict(payload.get("evolution"), "evolution"),
+        evolutionPayload,
     )
     loss = _coerce_dataclass(LossConfig, _ensure_dict(payload.get("loss"), "loss"))
     logging = _coerce_dataclass(
@@ -179,15 +192,6 @@ def validateRunConfig(config: RunConfig) -> None:
         and config.evolution.wideResponseChunkSize <= 0
     ):
         raise ValueError("evolution.wideResponseChunkSize must be positive when set")
-    if config.evolution.responseChunkShapeStrategy not in {
-        "balanced",
-        "cap_reduction",
-        "grid_first",
-    }:
-        raise ValueError(
-            "evolution.responseChunkShapeStrategy must be one of "
-            "'balanced', 'cap_reduction', or 'grid_first'"
-        )
     if config.evolution.responseReductionTileCap <= 0:
         raise ValueError("evolution.responseReductionTileCap must be positive")
     if config.logging.datasetFlushEverySteps <= 0:
@@ -203,11 +207,18 @@ def validateRunConfig(config: RunConfig) -> None:
     targetSources = [
         config.target.reference is not None,
         config.target.references is not None,
+        config.target.manifest is not None,
         config.target.inline is not None,
         config.target.inlineBatch is not None,
     ]
     if sum(targetSources) != 1:
         raise ValueError("target must define exactly one source mode")
+    if config.target.selection not in {"first", "random_without_replacement"}:
+        raise ValueError(
+            "target.selection must be either 'first' or 'random_without_replacement'"
+        )
+    if config.target.selectionCount is not None and config.target.selectionCount <= 0:
+        raise ValueError("target.selectionCount must be positive when set")
     if config.target.decimate <= 0:
         raise ValueError("target.decimate must be positive")
 
@@ -241,14 +252,59 @@ def _loadTargetReference(path: Path, fmt: str, resolutionDeg: float) -> TargetSp
             return TargetSpec.fromSerializedTargetSpec(payload)
         raise ValueError(f"unsupported target payload in {path}")
     if fmt == "zones_json":
-        from ui.export_target import load_target_from_zones_json
-
         return load_target_from_zones_json(path, resolution_deg=resolutionDeg)
     raise ValueError(f"unsupported target format: {fmt}")
 
 
 def _loadInlineTarget(payload: dict[str, Any]) -> TargetSpec:
     return TargetSpec.fromMapping(payload)
+
+
+def _resolveManifestRecordPath(manifestPath: Path, recordPath: str) -> Path:
+    path = Path(recordPath)
+    return path if path.is_absolute() else manifestPath.parent / path
+
+
+def _loadTargetManifest(config: RunConfig) -> TargetBatch:
+    targetConfig = config.target
+    assert targetConfig.manifest is not None
+
+    manifestPath = Path(targetConfig.manifest)
+    manifestPayload = _load_yaml(manifestPath)
+    records = manifestPayload.get("records")
+    if not isinstance(records, list) or not records:
+        raise ValueError(f"target manifest {manifestPath} must contain a non-empty records list")
+
+    selectionCount = (
+        config.evolution.batchSize
+        if targetConfig.selectionCount is None
+        else int(targetConfig.selectionCount)
+    )
+    if selectionCount > len(records):
+        raise ValueError(
+            f"target manifest {manifestPath} only has {len(records)} records "
+            f"(requested {selectionCount})"
+        )
+
+    if targetConfig.selection == "first":
+        selectedRecords = records[:selectionCount]
+    else:
+        rng = random.Random(targetConfig.selectionSeed)
+        selectedRecords = rng.sample(records, selectionCount)
+
+    targets = []
+    for record in selectedRecords:
+        if not isinstance(record, dict) or "path" not in record:
+            raise ValueError(f"target manifest {manifestPath} contains an invalid record: {record!r}")
+        recordPath = _resolveManifestRecordPath(manifestPath, str(record["path"]))
+        targets.append(
+            _loadTargetReference(
+                recordPath,
+                _detectTargetFormat(recordPath, targetConfig.format),
+                targetConfig.resolutionDeg,
+            )
+        )
+    return TargetBatch.fromTargetSpecs(targets)
 
 
 def resolveTarget(config: RunConfig) -> TargetLike:
@@ -267,6 +323,8 @@ def resolveTarget(config: RunConfig) -> TargetLike:
             for path in targetConfig.references
         ]
         target = TargetBatch.fromTargetSpecs(targets)
+    elif targetConfig.manifest is not None:
+        target = _loadTargetManifest(config)
     elif targetConfig.inline is not None:
         target = _loadInlineTarget(targetConfig.inline)
     elif targetConfig.inlineBatch is not None:

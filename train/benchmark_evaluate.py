@@ -34,7 +34,6 @@ def _run_benchmark(
             targetMode=controller.targetMode,
             linearResponseChunkSize=controller.config.linearResponseChunkSize,
             wideResponseChunkSize=controller.config.wideResponseChunkSize,
-            responseChunkShapeStrategy=controller.config.responseChunkShapeStrategy,
             responseReductionTileCap=controller.config.responseReductionTileCap,
             allowSharedTargetFastPath=allowSharedTargetFastPath,
         )

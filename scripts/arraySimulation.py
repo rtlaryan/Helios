@@ -1,18 +1,13 @@
-from collections.abc import Iterator
-from contextlib import contextmanager
-from typing import Literal
-
 import torch
 
 from .arrayBatch import ArrayBatch
 
-ChunkShapeStrategy = Literal["balanced", "cap_reduction", "grid_first"]
-
-DEFAULT_CHUNK_SHAPE_STRATEGY: ChunkShapeStrategy = "balanced"
 DEFAULT_REDUCTION_TILE_CAP = 256
+MAX_CUDA_BATCH_STREAMS = 4
+DEFAULT_TORCH_COMPILE_BACKEND = "inductor"
 
-_ACTIVE_CHUNK_SHAPE_STRATEGY: ChunkShapeStrategy = DEFAULT_CHUNK_SHAPE_STRATEGY
-_ACTIVE_REDUCTION_TILE_CAP = DEFAULT_REDUCTION_TILE_CAP
+_COMPILED_ARRAY_RESPONSE_CORE = None
+_COMPILED_ARRAY_RESPONSE_CORE_CONFIG: tuple[str, str | None, bool] | None = None
 
 
 def _validateReductionTileCap(reductionTileCap: int) -> int:
@@ -20,37 +15,6 @@ def _validateReductionTileCap(reductionTileCap: int) -> int:
     if reductionTileCap <= 0:
         raise ValueError("reductionTileCap must be positive")
     return reductionTileCap
-
-
-def getChunkShapeStrategy() -> tuple[ChunkShapeStrategy, int]:
-    return _ACTIVE_CHUNK_SHAPE_STRATEGY, _ACTIVE_REDUCTION_TILE_CAP
-
-
-def setChunkShapeStrategy(
-    strategy: ChunkShapeStrategy,
-    *,
-    reductionTileCap: int = DEFAULT_REDUCTION_TILE_CAP,
-) -> None:
-    global _ACTIVE_CHUNK_SHAPE_STRATEGY, _ACTIVE_REDUCTION_TILE_CAP
-    _ACTIVE_CHUNK_SHAPE_STRATEGY = strategy
-    _ACTIVE_REDUCTION_TILE_CAP = _validateReductionTileCap(reductionTileCap)
-
-
-@contextmanager
-def useChunkShapeStrategy(
-    strategy: ChunkShapeStrategy,
-    *,
-    reductionTileCap: int = DEFAULT_REDUCTION_TILE_CAP,
-) -> Iterator[None]:
-    previousStrategy, previousReductionTileCap = getChunkShapeStrategy()
-    setChunkShapeStrategy(strategy, reductionTileCap=reductionTileCap)
-    try:
-        yield
-    finally:
-        setChunkShapeStrategy(
-            previousStrategy,
-            reductionTileCap=previousReductionTileCap,
-        )
 
 
 def precomputeGridWaveVector(
@@ -161,120 +125,125 @@ def chooseChunkShape(
     elementCount: int,
     gridRemaining: int,
     chunkSize: int,
-    strategy: ChunkShapeStrategy | None = None,
-    reductionTileCap: int | None = None,
+    reductionTileCap: int = DEFAULT_REDUCTION_TILE_CAP,
 ) -> tuple[int, int, int]:
-    """
-    Choose (Bc, Nc, Pc) such that Bc * Nc * Pc <= chunkSize.
-    """
     batchRemaining = int(batchRemaining)
     elementCount = int(elementCount)
     gridRemaining = int(gridRemaining)
     chunkSize = int(chunkSize)
+    if batchRemaining <= 0:
+        raise ValueError("batchRemaining must be positive")
+    if elementCount <= 0:
+        raise ValueError("elementCount must be positive")
+    if gridRemaining <= 0:
+        raise ValueError("gridRemaining must be positive")
     if chunkSize <= 0:
         raise ValueError("chunkSize must be positive")
-    strategy = _ACTIVE_CHUNK_SHAPE_STRATEGY if strategy is None else strategy
-    reductionTileCap = (
-        _ACTIVE_REDUCTION_TILE_CAP if reductionTileCap is None else reductionTileCap
-    )
     reductionTileCap = _validateReductionTileCap(reductionTileCap)
 
-    def _balanced_shape() -> tuple[int, int, int]:
-        bc = min(batchRemaining, max(1, int(round(chunkSize ** (1 / 3)))))
-        pc = min(gridRemaining, max(1, int(round((chunkSize / bc) ** 0.5))))
-        nc = min(elementCount, max(1, chunkSize // (bc * pc)))
+    nc = min(elementCount, reductionTileCap, chunkSize)
+    if batchRemaining * nc <= chunkSize:
+        bc = batchRemaining
         pc = min(gridRemaining, max(1, chunkSize // (bc * nc)))
         return bc, nc, pc
 
-    if strategy == "balanced":
-        return _balanced_shape()
-
-    if strategy == "cap_reduction":
-        bc, nc, pc = _balanced_shape()
-        nc = min(nc, elementCount, reductionTileCap)
-        pc = min(gridRemaining, max(1, chunkSize // (bc * nc)))
-        return bc, nc, pc
-
-    if strategy == "grid_first":
-        nc = min(elementCount, reductionTileCap, chunkSize)
-        pc = min(gridRemaining, max(1, int(round((chunkSize / nc) ** 0.5))))
-        bc = min(batchRemaining, max(1, chunkSize // (nc * pc)))
-        pc = min(gridRemaining, max(1, chunkSize // (bc * nc)))
-        return bc, nc, pc
-
-    raise ValueError(f"unknown chunk shape strategy: {strategy}")
+    bc = min(batchRemaining, max(1, chunkSize // nc))
+    return bc, nc, 1
 
 
-def arrayResponseCoreOLD(
+def _accumulateResponseChunk(
+    posB: torch.Tensor,
+    wB: torch.Tensor,
+    waveChunk: torch.Tensor,
+    *,
+    elementCount: int,
+    nc: int,
+    isBatchedGrid: bool,
+    responseChunk: torch.Tensor,
+) -> None:
+    responseChunk.zero_()
+
+    nStart = 0
+    while nStart < elementCount:
+        nEnd = min(elementCount, nStart + nc)
+
+        posChunk = posB[:, :, nStart:nEnd]
+        wChunk = wB[:, nStart:nEnd]
+
+        if isBatchedGrid:
+            phaseChunk = torch.einsum("bin,bip->bnp", posChunk, waveChunk)
+        else:
+            phaseChunk = torch.einsum("bin,ip->bnp", posChunk, waveChunk)
+        manifoldChunk = torch.exp(1j * phaseChunk)
+        responseChunk += torch.einsum("bn,bnp->bp", wChunk, manifoldChunk)
+
+        nStart = nEnd
+
+
+def _writeResponseTile(
+    *,
+    posB: torch.Tensor,
+    wB: torch.Tensor,
+    waveB: torch.Tensor,
+    fullResponseFlatB: torch.Tensor,
+    responseChunkBuffer: torch.Tensor,
+    pStart: int,
+    pEnd: int,
+    elementCount: int,
+    nc: int,
+    isBatchedGrid: bool,
+) -> None:
+    waveChunk = waveB[:, :, pStart:pEnd] if isBatchedGrid else waveB[:, pStart:pEnd]
+    responseChunk = responseChunkBuffer[:, : pEnd - pStart]
+    _accumulateResponseChunk(
+        posB,
+        wB,
+        waveChunk,
+        elementCount=elementCount,
+        nc=nc,
+        isBatchedGrid=isBatchedGrid,
+        responseChunk=responseChunk,
+    )
+    fullResponseFlatB[:, pStart:pEnd] = responseChunk.abs().square()
+
+
+def _buildBatchStripes(
+    *,
+    bStart: int,
+    batchSize: int,
+    batchStride: int,
+    waveVectorFlat: torch.Tensor,
     elementLocalPosition: torch.Tensor,
-    weights: torch.Tensor,
-    wavelength: float,
-    azimuth: torch.Tensor,
-    elevation: torch.Tensor,
-    gain: torch.Tensor,
-    chunkSize: int | None = 8192,
-    dB: bool = True,
-    normalize: bool = True,
-) -> torch.Tensor:
-    batchSize = elementLocalPosition.shape[0]
-
-    waveVector, gridShape = precomputeGridWaveVector(wavelength, azimuth, elevation)
-
-    # -----------------------------------------
-    # Handle shared grid [...] vs batched grid [B, ...]
-    # -----------------------------------------
-    if waveVector.ndim >= 2 and waveVector.shape[0] == batchSize:
-        # batched grid: [B, ..., 3]
-        spatialShape = gridShape[1:]
-        waveVectorFlat = waveVector.reshape(batchSize, -1, 3).transpose(1, 2)  # [B, 3, P]
-        gridSize = waveVectorFlat.shape[-1]
-
-        if chunkSize is None:
-            chunkSize = gridSize
-
-        weightsConj = weights.conj().clone()
-
-        fullResponse = []
-        for chunk in range(0, gridSize, chunkSize):
-            waveVectorChunk = waveVectorFlat[:, :, chunk : chunk + chunkSize]  # [B, 3, Pc]
-            phaseChunk = torch.einsum("bin,bip->bnp", elementLocalPosition, waveVectorChunk)
-            arrayManifoldChunk = torch.exp(1j * phaseChunk)
-            chunkResponse = torch.einsum("bn,bnp->bp", weightsConj, arrayManifoldChunk)
-            fullResponse.append(chunkResponse)
-
-        fullResponse = torch.cat(fullResponse, dim=1).reshape(batchSize, *spatialShape)
-
-    else:
-        # shared grid: [..., 3]
-        spatialShape = gridShape
-        waveVectorFlat = waveVector.reshape(-1, 3).transpose(0, 1)  # [3, P]
-        gridSize = waveVectorFlat.shape[-1]
-
-        if chunkSize is None:
-            chunkSize = gridSize
-
-        weightsConj = weights.conj().clone()
-
-        fullResponse = []
-        for chunk in range(0, gridSize, chunkSize):
-            waveVectorChunk = waveVectorFlat[:, chunk : chunk + chunkSize]  # [3, Pc]
-            phaseChunk = torch.einsum("bin,ip->bnp", elementLocalPosition, waveVectorChunk)
-            arrayManifoldChunk = torch.exp(1j * phaseChunk)
-            chunkResponse = torch.einsum("bn,bnp->bp", weightsConj, arrayManifoldChunk)
-            fullResponse.append(chunkResponse)
-
-        fullResponse = torch.cat(fullResponse, dim=1).reshape(batchSize, *spatialShape)
-
-    fullResponse = fullResponse.abs().square()
-
-    if normalize:
-        fullResponse = normalizePower(fullResponse)
-
-    if dB:
-        gainView = gain.view(-1, *([1] * (fullResponse.ndim - 1)))
-        fullResponse = 10.0 * torch.log10(fullResponse.clamp_min(1e-10)) + gainView
-
-    return fullResponse
+    weightsConj: torch.Tensor,
+    fullResponseFlat: torch.Tensor,
+    isBatchedGrid: bool,
+    device: torch.device,
+    complexDtype: torch.dtype,
+    pcMax: int,
+) -> list[dict[str, torch.Tensor | int]]:
+    batchStripes: list[dict[str, torch.Tensor | int]] = []
+    stripeStart = bStart
+    while stripeStart < batchSize and len(batchStripes) < MAX_CUDA_BATCH_STREAMS:
+        stripeEnd = min(batchSize, stripeStart + batchStride)
+        stripeBc = stripeEnd - stripeStart
+        batchStripes.append(
+            {
+                "start": stripeStart,
+                "end": stripeEnd,
+                "batchSize": stripeBc,
+                "pos": elementLocalPosition[stripeStart:stripeEnd],
+                "weights": weightsConj[stripeStart:stripeEnd],
+                "wave": waveVectorFlat[stripeStart:stripeEnd] if isBatchedGrid else waveVectorFlat,
+                "output": fullResponseFlat[stripeStart:stripeEnd],
+                "buffer": torch.empty(
+                    (stripeBc, pcMax),
+                    device=device,
+                    dtype=complexDtype,
+                ),
+            }
+        )
+        stripeStart = stripeEnd
+    return batchStripes
 
 
 def _arrayResponseCoreReference(
@@ -285,6 +254,7 @@ def _arrayResponseCoreReference(
     elevation: torch.Tensor,
     gain: torch.Tensor,
     chunkSize: int | None = 2_000_000,
+    reductionTileCap: int = DEFAULT_REDUCTION_TILE_CAP,
     dB: bool = True,
     normalize: bool = True,
     clearCache: bool = False,
@@ -324,6 +294,7 @@ def _arrayResponseCoreReference(
         device=device,
         requestedChunkSize=chunkSize,
     )
+    reductionTileCap = _validateReductionTileCap(reductionTileCap)
 
     fullResponse = torch.empty(
         (batchSize, *spatialShape),
@@ -339,6 +310,7 @@ def _arrayResponseCoreReference(
             elementCount=elementCount,
             gridRemaining=gridSize,
             chunkSize=chunkSize,
+            reductionTileCap=reductionTileCap,
         )
         bEnd = min(batchSize, bStart + bc)
         bc = bEnd - bStart
@@ -361,36 +333,29 @@ def _arrayResponseCoreReference(
                 elementCount=elementCount,
                 gridRemaining=gridRemaining,
                 chunkSize=chunkSize,
+                reductionTileCap=reductionTileCap,
             )
             pEnd = min(gridSize, pStart + pc)
             pc = pEnd - pStart
 
-            waveChunk = waveB[:, :, pStart:pEnd] if isBatchedGrid else waveB[:, pStart:pEnd]
             responseChunk = torch.zeros(
                 (bc, pc),
                 device=device,
                 dtype=complexDtype,
             )
 
-            nStart = 0
-            while nStart < elementCount:
-                nEnd = min(elementCount, nStart + nc)
-
-                posChunk = posB[:, :, nStart:nEnd]  # [Bc, 3, Nc]
-                wChunk = wB[:, nStart:nEnd]  # [Bc, Nc]
-
-                if isBatchedGrid:
-                    phaseChunk = torch.einsum("bin,bip->bnp", posChunk, waveChunk)
-                else:
-                    phaseChunk = torch.einsum("bin,ip->bnp", posChunk, waveChunk)
-                manifoldChunk = torch.exp(1j * phaseChunk)
-                responseChunk += torch.einsum("bn,bnp->bp", wChunk, manifoldChunk)
-
-                del posChunk, wChunk, phaseChunk, manifoldChunk
-                nStart = nEnd
+            waveChunk = waveB[:, :, pStart:pEnd] if isBatchedGrid else waveB[:, pStart:pEnd]
+            _accumulateResponseChunk(
+                posB,
+                wB,
+                waveChunk,
+                elementCount=elementCount,
+                nc=nc,
+                isBatchedGrid=isBatchedGrid,
+                responseChunk=responseChunk,
+            )
 
             responseFlatB[:, pStart:pEnd] = responseChunk
-            del waveChunk, responseChunk
             pStart = pEnd
 
         fullResponse[bStart:bEnd] = responseFlatB.abs().square().reshape(bc, *spatialShape)
@@ -413,7 +378,7 @@ def _arrayResponseCoreReference(
     return fullResponse
 
 
-def arrayResponseCore(
+def _arrayResponseCoreEager(
     elementLocalPosition: torch.Tensor,
     weights: torch.Tensor,
     wavelength: float,
@@ -421,6 +386,7 @@ def arrayResponseCore(
     elevation: torch.Tensor,
     gain: torch.Tensor,
     chunkSize: int | None = 2_000_000,
+    reductionTileCap: int = DEFAULT_REDUCTION_TILE_CAP,
     dB: bool = True,
     normalize: bool = True,
     clearCache: bool = False,
@@ -459,6 +425,7 @@ def arrayResponseCore(
         device=device,
         requestedChunkSize=chunkSize,
     )
+    reductionTileCap = _validateReductionTileCap(reductionTileCap)
 
     fullResponse = torch.empty(
         (batchSize, *spatialShape),
@@ -475,21 +442,25 @@ def arrayResponseCore(
             elementCount=elementCount,
             gridRemaining=gridSize,
             chunkSize=chunkSize,
+            reductionTileCap=reductionTileCap,
         )
-        bEnd = min(batchSize, bStart + bc)
-        bc = bEnd - bStart
-
-        posB = elementLocalPosition[bStart:bEnd]  # [Bc, 3, N]
-        wB = weightsConj[bStart:bEnd]  # [Bc, N]
-        waveB = waveVectorFlat[bStart:bEnd] if isBatchedGrid else waveVectorFlat
-        fullResponseFlatB = fullResponseFlat[bStart:bEnd]
-
-        # Reuse one complex scratch tile and write real power directly into the output.
-        responseChunkBuffer = torch.empty(
-            (bc, pcMax),
+        batchStripes = _buildBatchStripes(
+            bStart=bStart,
+            batchSize=batchSize,
+            batchStride=bc,
+            waveVectorFlat=waveVectorFlat,
+            elementLocalPosition=elementLocalPosition,
+            weightsConj=weightsConj,
+            fullResponseFlat=fullResponseFlat,
+            isBatchedGrid=isBatchedGrid,
             device=device,
-            dtype=complexDtype,
+            complexDtype=complexDtype,
+            pcMax=pcMax,
         )
+        bc = int(batchStripes[0]["batchSize"])
+        streams = []
+        if device.type == "cuda" and len(batchStripes) > 1:
+            streams = [torch.cuda.Stream(device=device) for _ in batchStripes]
 
         pStart = 0
         while pStart < gridSize:
@@ -499,37 +470,48 @@ def arrayResponseCore(
                 elementCount=elementCount,
                 gridRemaining=gridRemaining,
                 chunkSize=chunkSize,
+                reductionTileCap=reductionTileCap,
             )
             pEnd = min(gridSize, pStart + pc)
             pc = pEnd - pStart
 
-            waveChunk = waveB[:, :, pStart:pEnd] if isBatchedGrid else waveB[:, pStart:pEnd]
-            responseChunk = responseChunkBuffer[:, :pc]
-            responseChunk.zero_()
+            for stripeIndex, stripe in enumerate(batchStripes):
+                stream = streams[stripeIndex] if stripeIndex < len(streams) else None
+                if stream is None:
+                    _writeResponseTile(
+                        posB=stripe["pos"],
+                        wB=stripe["weights"],
+                        waveB=stripe["wave"],
+                        fullResponseFlatB=stripe["output"],
+                        responseChunkBuffer=stripe["buffer"],
+                        pStart=pStart,
+                        pEnd=pEnd,
+                        elementCount=elementCount,
+                        nc=nc,
+                        isBatchedGrid=isBatchedGrid,
+                    )
+                    continue
 
-            nStart = 0
-            while nStart < elementCount:
-                nEnd = min(elementCount, nStart + nc)
-
-                posChunk = posB[:, :, nStart:nEnd]  # [Bc, 3, Nc]
-                wChunk = wB[:, nStart:nEnd]  # [Bc, Nc]
-
-                if isBatchedGrid:
-                    phaseChunk = torch.einsum("bin,bip->bnp", posChunk, waveChunk)
-                else:
-                    phaseChunk = torch.einsum("bin,ip->bnp", posChunk, waveChunk)
-                manifoldChunk = torch.exp(1j * phaseChunk)
-                responseChunk += torch.einsum("bn,bnp->bp", wChunk, manifoldChunk)
-
-                del posChunk, wChunk, phaseChunk, manifoldChunk
-                nStart = nEnd
-
-            fullResponseFlatB[:, pStart:pEnd] = responseChunk.abs().square()
-            del waveChunk, responseChunk
+                with torch.cuda.stream(stream):
+                    _writeResponseTile(
+                        posB=stripe["pos"],
+                        wB=stripe["weights"],
+                        waveB=stripe["wave"],
+                        fullResponseFlatB=stripe["output"],
+                        responseChunkBuffer=stripe["buffer"],
+                        pStart=pStart,
+                        pEnd=pEnd,
+                        elementCount=elementCount,
+                        nc=nc,
+                        isBatchedGrid=isBatchedGrid,
+                    )
+            if streams:
+                currentStream = torch.cuda.current_stream(device=device)
+                for stream in streams:
+                    currentStream.wait_stream(stream)
             pStart = pEnd
 
-        del posB, wB, waveB, fullResponseFlatB, responseChunkBuffer
-        bStart = bEnd
+        bStart = int(batchStripes[-1]["end"])
 
     del waveVector, waveVectorFlat, weightsConj, fullResponseFlat
 
@@ -547,12 +529,110 @@ def arrayResponseCore(
     return fullResponse
 
 
+def isTorchCompileAvailable() -> bool:
+    return callable(getattr(torch, "compile", None))
+
+
+def resetArrayResponseCoreCompiledCache() -> None:
+    global _COMPILED_ARRAY_RESPONSE_CORE, _COMPILED_ARRAY_RESPONSE_CORE_CONFIG
+    _COMPILED_ARRAY_RESPONSE_CORE = None
+    _COMPILED_ARRAY_RESPONSE_CORE_CONFIG = None
+
+
+def _getCompiledArrayResponseCore(
+    *,
+    backend: str = DEFAULT_TORCH_COMPILE_BACKEND,
+    mode: str | None = None,
+    dynamic: bool = False,
+):
+    global _COMPILED_ARRAY_RESPONSE_CORE, _COMPILED_ARRAY_RESPONSE_CORE_CONFIG
+    if not isTorchCompileAvailable():
+        raise RuntimeError("torch.compile is not available in this PyTorch build")
+
+    config = (backend, mode, dynamic)
+    if _COMPILED_ARRAY_RESPONSE_CORE is None or _COMPILED_ARRAY_RESPONSE_CORE_CONFIG != config:
+        _COMPILED_ARRAY_RESPONSE_CORE = torch.compile(
+            _arrayResponseCoreEager,
+            backend=backend,
+            mode=mode,
+            dynamic=dynamic,
+        )
+        _COMPILED_ARRAY_RESPONSE_CORE_CONFIG = config
+    return _COMPILED_ARRAY_RESPONSE_CORE
+
+
+def arrayResponseCore(
+    elementLocalPosition: torch.Tensor,
+    weights: torch.Tensor,
+    wavelength: float,
+    azimuth: torch.Tensor,
+    elevation: torch.Tensor,
+    gain: torch.Tensor,
+    chunkSize: int | None = 2_000_000,
+    reductionTileCap: int = DEFAULT_REDUCTION_TILE_CAP,
+    dB: bool = True,
+    normalize: bool = True,
+    clearCache: bool = False,
+) -> torch.Tensor:
+    return _arrayResponseCoreEager(
+        elementLocalPosition=elementLocalPosition,
+        weights=weights,
+        wavelength=wavelength,
+        azimuth=azimuth,
+        elevation=elevation,
+        gain=gain,
+        chunkSize=chunkSize,
+        reductionTileCap=reductionTileCap,
+        dB=dB,
+        normalize=normalize,
+        clearCache=clearCache,
+    )
+
+
+def arrayResponseCoreCompiled(
+    elementLocalPosition: torch.Tensor,
+    weights: torch.Tensor,
+    wavelength: float,
+    azimuth: torch.Tensor,
+    elevation: torch.Tensor,
+    gain: torch.Tensor,
+    chunkSize: int | None = 2_000_000,
+    reductionTileCap: int = DEFAULT_REDUCTION_TILE_CAP,
+    dB: bool = True,
+    normalize: bool = True,
+    clearCache: bool = False,
+    *,
+    backend: str = DEFAULT_TORCH_COMPILE_BACKEND,
+    mode: str | None = None,
+    dynamic: bool = False,
+) -> torch.Tensor:
+    compiledCore = _getCompiledArrayResponseCore(
+        backend=backend,
+        mode=mode,
+        dynamic=dynamic,
+    )
+    return compiledCore(
+        elementLocalPosition=elementLocalPosition,
+        weights=weights,
+        wavelength=wavelength,
+        azimuth=azimuth,
+        elevation=elevation,
+        gain=gain,
+        chunkSize=chunkSize,
+        reductionTileCap=reductionTileCap,
+        dB=dB,
+        normalize=normalize,
+        clearCache=clearCache,
+    )
+
+
 def arrayResponseSample(
     batch: ArrayBatch,
     sampleID: int,
     azimuth: torch.Tensor,
     elevation: torch.Tensor,
     chunkSize: int | None = 3_000_000,
+    reductionTileCap: int = DEFAULT_REDUCTION_TILE_CAP,
     dB: bool = True,
     normalize: bool = True,
 ) -> torch.Tensor:
@@ -568,8 +648,44 @@ def arrayResponseSample(
         elevation=elevation,
         gain=batch.gain[sampleID : sampleID + 1],
         chunkSize=chunkSize,
+        reductionTileCap=reductionTileCap,
         dB=dB,
         normalize=normalize,
+    )[0]
+
+
+def arrayResponseSampleCompiled(
+    batch: ArrayBatch,
+    sampleID: int,
+    azimuth: torch.Tensor,
+    elevation: torch.Tensor,
+    chunkSize: int | None = 3_000_000,
+    reductionTileCap: int = DEFAULT_REDUCTION_TILE_CAP,
+    dB: bool = True,
+    normalize: bool = True,
+    *,
+    backend: str = DEFAULT_TORCH_COMPILE_BACKEND,
+    mode: str | None = None,
+    dynamic: bool = False,
+) -> torch.Tensor:
+    azimuth, elevation = torch.broadcast_tensors(azimuth, elevation)
+    azimuth = azimuth.unsqueeze(0)
+    elevation = elevation.unsqueeze(0)
+
+    return arrayResponseCoreCompiled(
+        elementLocalPosition=batch.elementLocalPosition[sampleID : sampleID + 1],
+        weights=batch.weights[sampleID : sampleID + 1],
+        wavelength=batch.wavelength,
+        azimuth=azimuth,
+        elevation=elevation,
+        gain=batch.gain[sampleID : sampleID + 1],
+        chunkSize=chunkSize,
+        reductionTileCap=reductionTileCap,
+        dB=dB,
+        normalize=normalize,
+        backend=backend,
+        mode=mode,
+        dynamic=dynamic,
     )[0]
 
 
@@ -577,6 +693,7 @@ def arrayResponseBatch(
     batch: ArrayBatch,
     relativeTargetAZEL: tuple[torch.Tensor, torch.Tensor],
     chunkSize: int | None = None,
+    reductionTileCap: int = DEFAULT_REDUCTION_TILE_CAP,
     dB: bool = False,
     normalize: bool = False,
 ) -> torch.Tensor:
@@ -588,6 +705,36 @@ def arrayResponseBatch(
         elevation=relativeTargetAZEL[1],
         gain=batch.gain,
         chunkSize=chunkSize,
+        reductionTileCap=reductionTileCap,
         dB=dB,
         normalize=normalize,
+    )
+
+
+def arrayResponseBatchCompiled(
+    batch: ArrayBatch,
+    relativeTargetAZEL: tuple[torch.Tensor, torch.Tensor],
+    chunkSize: int | None = None,
+    reductionTileCap: int = DEFAULT_REDUCTION_TILE_CAP,
+    dB: bool = False,
+    normalize: bool = False,
+    *,
+    backend: str = DEFAULT_TORCH_COMPILE_BACKEND,
+    mode: str | None = None,
+    dynamic: bool = False,
+) -> torch.Tensor:
+    return arrayResponseCoreCompiled(
+        elementLocalPosition=batch.elementLocalPosition,
+        weights=batch.weights,
+        wavelength=batch.wavelength,
+        azimuth=relativeTargetAZEL[0],
+        elevation=relativeTargetAZEL[1],
+        gain=batch.gain,
+        chunkSize=chunkSize,
+        reductionTileCap=reductionTileCap,
+        dB=dB,
+        normalize=normalize,
+        backend=backend,
+        mode=mode,
+        dynamic=dynamic,
     )

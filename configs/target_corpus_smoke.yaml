@@ -1,0 +1,45 @@
+count: 4
+seed: 7
+workers: 2
+
+output:
+  root: data/targets/sample_corpus_smoke
+  manifestPath: data/targets/sample_corpus_smoke/manifest.yaml
+  prefix: target
+
+grid:
+  latRange: [0.0, 10.0]
+  lonRange: [20.0, 30.0]
+  resolutionDeg: 0.25
+  decimate: 1
+  powerMode: normalized
+
+curriculum:
+  weights:
+    single_circle: 1.0
+    irregular_shape: 1.0
+    multibeam: 1.0
+
+categories:
+  single_circle:
+    radiusRange: [0.75, 2.5]
+    rolloffRange: [0.3, 1.2]
+    peakDBRange: [-3.0, 0.0]
+
+  irregular_shape:
+    componentCountRange: [2, 4]
+    circleComponentProbability: 0.5
+    radiusRange: [0.75, 2.0]
+    polygonRadiusRange: [1.0, 3.0]
+    polygonVertexCountRange: [3, 6]
+    componentJitterRange: [0.5, 3.5]
+    rolloffRange: [0.3, 1.2]
+    peakDBRange: [-6.0, 0.0]
+
+  multibeam:
+    beamCountRange: [2, 4]
+    radiusRange: [0.75, 2.0]
+    rolloffRange: [0.3, 1.2]
+    peakDBRange: [-3.0, 0.0]
+    minSeparationDeg: 2.5
+    placementAttempts: 64

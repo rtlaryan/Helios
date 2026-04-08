@@ -10,7 +10,6 @@ import torch
 import torch.nn.functional as F
 import yaml
 from scripts.arrayBatch import ArrayBatch, merge
-from scripts.arraySimulation import ChunkShapeStrategy
 from scripts.arraySpec import ArraySpec
 from scripts.batchFactory import generateBatch
 from scripts.plots import projectResponseOnTarget
@@ -64,7 +63,6 @@ _RESUME_MUTABLE_EVOLUTION_KEYS = {
     "wideGridRampSteps",
     "linearResponseChunkSize",
     "wideResponseChunkSize",
-    "responseChunkShapeStrategy",
     "responseReductionTileCap",
 }
 _RESUME_MUTABLE_EXPERIMENT_KEYS = {
@@ -210,7 +208,6 @@ class EvolutionConfig:
     wideGridRampSteps: int | None = None
     linearResponseChunkSize: int | None = None
     wideResponseChunkSize: int | None = None
-    responseChunkShapeStrategy: ChunkShapeStrategy = "balanced"
     responseReductionTileCap: int = 256
 
     @property
@@ -277,7 +274,6 @@ class EvolutionConfig:
             "wideGridRampSteps": self.wideGridRampSteps,
             "linearResponseChunkSize": self.linearResponseChunkSize,
             "wideResponseChunkSize": self.wideResponseChunkSize,
-            "responseChunkShapeStrategy": self.responseChunkShapeStrategy,
             "responseReductionTileCap": self.responseReductionTileCap,
         }
 
@@ -714,7 +710,6 @@ class EvolutionController:
             targetMode=self.targetMode,
             linearResponseChunkSize=self.config.linearResponseChunkSize,
             wideResponseChunkSize=self.config.wideResponseChunkSize,
-            responseChunkShapeStrategy=self.config.responseChunkShapeStrategy,
             responseReductionTileCap=self.config.responseReductionTileCap,
         )
 
