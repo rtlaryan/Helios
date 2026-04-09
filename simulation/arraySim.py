@@ -130,7 +130,8 @@ def chooseChunkShape(
     return bc, nc, 1
 
 
-def arrayResponseCore(
+@torch.no_grad()
+def _arrayResponseCore(
     elementLocalPosition: torch.Tensor,
     weights: torch.Tensor,
     wavelength: float,
@@ -140,7 +141,7 @@ def arrayResponseCore(
     chunkSize: int | None = 2_000_000,
     dB: bool = False,
     normalize: bool = False,
-    clearCache: bool = False,
+    clearCache: bool = True,
     memSafe: bool = True,
 ) -> torch.Tensor:
     """
@@ -223,8 +224,15 @@ def arrayResponseCore(
                 wChunk = wB[:, nStart:nEnd]  # [Bc, Nc]
 
                 phaseChunk = torch.einsum("bin,bip->bnp", posChunk, waveChunk)
-                manifoldChunk = torch.exp(1j * phaseChunk)
+                # manifoldChunk = torch.exp(1j * phaseChunk)
+                manifoldChunk = torch.polar(
+                    torch.ones_like(phaseChunk),
+                    phaseChunk,
+                )
                 responseChunk += torch.einsum("bn,bnp->bp", wChunk, manifoldChunk)
+                # phaseChunk = torch.matmul(posChunk.transpose(1, 2), waveChunk)
+                ##manifoldChunk = torch.exp(1j * phaseChunk)
+                # responseChunk += torch.matmul(wChunk.unsqueeze(1), manifoldChunk).squeeze(1)
 
                 del posChunk, wChunk, phaseChunk, manifoldChunk
                 nStart = nEnd
@@ -238,6 +246,142 @@ def arrayResponseCore(
         bStart = bEnd
 
     del waveVector, weightsConj
+
+    if normalize:
+        fullResponse = normalizePower(fullResponse)
+
+    if dB:
+        gainView = gain.view(-1, *([1] * (fullResponse.ndim - 1)))
+        fullResponse = todB(fullResponse) + gainView
+        del gainView
+
+    if clearCache and device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    return fullResponse
+
+
+@torch.no_grad()
+def arrayResponseCore(
+    elementLocalPosition: torch.Tensor,
+    weights: torch.Tensor,
+    wavelength: float,
+    azimuth: torch.Tensor,
+    elevation: torch.Tensor,
+    gain: torch.Tensor,
+    chunkSize: int | None = 2_000_000,
+    dB: bool = False,
+    normalize: bool = False,
+    clearCache: bool = True,
+    memSafe: bool = True,
+) -> torch.Tensor:
+    """
+    elementLocalPosition: [B, 3, N]
+    weights: [B, N]
+    gain: [B]
+    azimuth/elevation: [B, ...]
+
+    chunkSize controls the dominant temporary:
+      [Bc, Nc, Pc]
+    """
+    batchSize = elementLocalPosition.shape[0]
+    elementCount = elementLocalPosition.shape[-1]
+    device = weights.device
+    real_dtype = weights.real.dtype
+
+    waveVector, gridShape = precomputeGridWaveVector(wavelength, azimuth, elevation)
+    spatialShape = gridShape[1:]
+    gridSize = waveVector.shape[-1]
+
+    chunkSize = resolveChunkSize(
+        batchSize, elementCount, gridSize, real_dtype, device, chunkSize, memSafe
+    )
+
+    fullResponse = torch.empty(
+        (batchSize, *spatialShape),
+        device=device,
+        dtype=real_dtype,
+    )
+
+    bStart = 0
+    while bStart < batchSize:
+        batchRemaining = batchSize - bStart
+        bc, _, _ = chooseChunkShape(
+            batchRemaining=batchRemaining,
+            elementCount=elementCount,
+            gridRemaining=gridSize,
+            chunkSize=chunkSize,
+        )
+        bEnd = min(batchSize, bStart + bc)
+        bc = bEnd - bStart
+
+        posB = elementLocalPosition[bStart:bEnd]  # [Bc, 3, N]
+        wRealB = weights[bStart:bEnd].real  # [Bc, N]
+        wImagB = weights[bStart:bEnd].imag  # [Bc, N]
+        waveB = waveVector[bStart:bEnd]  # [Bc, 3, P]
+
+        responseFlatB = torch.empty(
+            (bc, gridSize),
+            device=device,
+            dtype=real_dtype,
+        )
+
+        pStart = 0
+        while pStart < gridSize:
+            gridRemaining = gridSize - pStart
+            _, nc, pc = chooseChunkShape(
+                batchRemaining=bc,
+                elementCount=elementCount,
+                gridRemaining=gridRemaining,
+                chunkSize=chunkSize,
+            )
+            pEnd = min(gridSize, pStart + pc)
+            pc = pEnd - pStart
+
+            waveChunk = waveB[:, :, pStart:pEnd]  # [Bc, 3, Pc]
+            responseReal = torch.zeros(
+                (bc, pc),
+                device=device,
+                dtype=real_dtype,
+            )
+            responseImag = torch.zeros(
+                (bc, pc),
+                device=device,
+                dtype=real_dtype,
+            )
+
+            nStart = 0
+            while nStart < elementCount:
+                nEnd = min(elementCount, nStart + nc)
+
+                posChunk = posB[:, :, nStart:nEnd]  # [Bc, 3, Nc]
+                wRealChunk = wRealB[:, nStart:nEnd]  # [Bc, Nc]
+                wImagChunk = wImagB[:, nStart:nEnd]  # [Bc, Nc]
+
+                phaseChunk = torch.bmm(posChunk.transpose(1, 2), waveChunk)  # [Bc, Nc, Pc]
+                cosPhase = torch.cos(phaseChunk)
+                sinPhase = torch.sin(phaseChunk)
+
+                # conj(w) * exp(j * phase) with w = wr + j wi:
+                # real = wr * cos + wi * sin
+                # imag = wr * sin - wi * cos
+                responseReal += torch.bmm(wRealChunk.unsqueeze(1), cosPhase).squeeze(1)
+                responseReal += torch.bmm(wImagChunk.unsqueeze(1), sinPhase).squeeze(1)
+                responseImag += torch.bmm(wRealChunk.unsqueeze(1), sinPhase).squeeze(1)
+                responseImag -= torch.bmm(wImagChunk.unsqueeze(1), cosPhase).squeeze(1)
+
+                del posChunk, wRealChunk, wImagChunk, phaseChunk, cosPhase, sinPhase
+                nStart = nEnd
+
+            responseFlatB[:, pStart:pEnd] = responseReal.square() + responseImag.square()
+            del waveChunk, responseReal, responseImag
+            pStart = pEnd
+
+        fullResponse[bStart:bEnd] = responseFlatB.reshape(bc, *spatialShape)
+        del posB, wRealB, wImagB, waveB, responseFlatB
+        bStart = bEnd
+
+    del waveVector
 
     if normalize:
         fullResponse = normalizePower(fullResponse)
