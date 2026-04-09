@@ -1,4 +1,4 @@
-count: 200000
+count: 100000
 seed: 7
 workers: auto
 
@@ -10,7 +10,7 @@ output:
 grid:
   latRange: [0.0, 40.0]
   lonRange: [-80.0, 120.0]
-  resolutionDeg: 0.5
+  resolutionDeg: 0.25
   decimate: 1
   powerMode: normalized
 
