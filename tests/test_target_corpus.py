@@ -130,6 +130,37 @@ def test_generate_target_corpus_is_deterministic_and_curriculum_driven(tmp_path:
         torch.testing.assert_close(target_a.hotspotCoordinates, target_b.hotspotCoordinates)
 
 
+def test_generate_target_corpus_matches_single_worker_output_when_parallelized(tmp_path: Path) -> None:
+    config_path_single = tmp_path / "targets_single.yaml"
+    config_path_multi = tmp_path / "targets_multi.yaml"
+    output_root_single = tmp_path / "corpus_single"
+    output_root_multi = tmp_path / "corpus_multi"
+    write_corpus_config(config_path_single, output_root_single, count=8)
+    write_corpus_config(config_path_multi, output_root_multi, count=8)
+
+    manifest_single = generateTargetCorpus(config_path_single, workers=1, showProgress=False)
+    manifest_multi = generateTargetCorpus(config_path_multi, workers=2, showProgress=False)
+
+    assert manifest_single["workers"] == 1
+    assert manifest_multi["workers"] == 2
+    assert [record["category"] for record in manifest_single["records"]] == [
+        record["category"] for record in manifest_multi["records"]
+    ]
+
+    manifest_path_single = output_root_single / "manifest.yaml"
+    manifest_path_multi = output_root_multi / "manifest.yaml"
+    for record_single, record_multi in zip(
+        manifest_single["records"], manifest_multi["records"], strict=True
+    ):
+        target_single = load_target_from_record(manifest_path_single, record_single)
+        target_multi = load_target_from_record(manifest_path_multi, record_multi)
+        torch.testing.assert_close(target_single.powerMap, target_multi.powerMap)
+        torch.testing.assert_close(target_single.importanceMap, target_multi.importanceMap)
+        torch.testing.assert_close(
+            target_single.hotspotCoordinates, target_multi.hotspotCoordinates
+        )
+
+
 def test_generated_targets_are_valid_and_use_normalized_power_maps(tmp_path: Path) -> None:
     config_path = tmp_path / "targets.yaml"
     output_root = tmp_path / "corpus"

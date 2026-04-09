@@ -531,13 +531,6 @@ def _generate_target_payload(
     return index, category, target, metadata
 
 
-def _generate_target_payload_star(
-    args: tuple[int, str, TargetCorpusConfig],
-) -> tuple[int, str, TargetSpec, dict[str, Any]]:
-    index, category, config = args
-    return _generate_target_payload(index=index, category=category, config=config)
-
-
 def _save_generated_target(
     *,
     index: int,
@@ -556,6 +549,46 @@ def _save_generated_target(
         "path": _record_relative_path(target_path, manifest_path),
         **metadata,
     }
+
+
+def _generate_and_save_target(
+    *,
+    index: int,
+    category: str,
+    config: TargetCorpusConfig,
+    output_root: Path,
+    manifest_path: Path,
+    prefix: str,
+) -> tuple[int, dict[str, Any]]:
+    _, _, target, metadata = _generate_target_payload(
+        index=index,
+        category=category,
+        config=config,
+    )
+    record = _save_generated_target(
+        index=index,
+        category=category,
+        target=target,
+        metadata=metadata,
+        output_root=output_root,
+        manifest_path=manifest_path,
+        prefix=prefix,
+    )
+    return index, record
+
+
+def _generate_and_save_target_star(
+    args: tuple[int, str, TargetCorpusConfig, Path, Path, str],
+) -> tuple[int, dict[str, Any]]:
+    index, category, config, output_root, manifest_path, prefix = args
+    return _generate_and_save_target(
+        index=index,
+        category=category,
+        config=config,
+        output_root=output_root,
+        manifest_path=manifest_path,
+        prefix=prefix,
+    )
 
 
 def generateTargetCorpus(
@@ -584,7 +617,10 @@ def generateTargetCorpus(
     schedule = _build_category_schedule(curriculum_counts, schedule_rng)
 
     worker_count = _resolve_worker_count(config.workers)
-    job_args = [(index, category, config) for index, category in enumerate(schedule)]
+    job_args = [
+        (index, category, config, output_root, manifest_path, config.output.prefix)
+        for index, category in enumerate(schedule)
+    ]
     records_by_index: dict[int, dict[str, Any]] = {}
     progress_bar = _create_progress_bar(
         total=len(job_args),
@@ -594,31 +630,15 @@ def generateTargetCorpus(
     try:
         if worker_count == 1:
             for args in job_args:
-                index, category, target, metadata = _generate_target_payload_star(args)
-                records_by_index[index] = _save_generated_target(
-                    index=index,
-                    category=category,
-                    target=target,
-                    metadata=metadata,
-                    output_root=output_root,
-                    manifest_path=manifest_path,
-                    prefix=config.output.prefix,
-                )
+                index, record = _generate_and_save_target_star(args)
+                records_by_index[index] = record
                 progress_bar.update(1)
         else:
             with ProcessPoolExecutor(max_workers=worker_count) as executor:
-                futures = [executor.submit(_generate_target_payload_star, args) for args in job_args]
+                futures = [executor.submit(_generate_and_save_target_star, args) for args in job_args]
                 for future in as_completed(futures):
-                    index, category, target, metadata = future.result()
-                    records_by_index[index] = _save_generated_target(
-                        index=index,
-                        category=category,
-                        target=target,
-                        metadata=metadata,
-                        output_root=output_root,
-                        manifest_path=manifest_path,
-                        prefix=config.output.prefix,
-                    )
+                    index, record = future.result()
+                    records_by_index[index] = record
                     progress_bar.update(1)
     finally:
         progress_bar.close()
