@@ -1,5 +1,5 @@
 experiment:
-  name: evo_3_multibeam
+  name: evo_3_multibeam_new
   logDir: data/runs
   archiveDir: data/archive
   resume: false
@@ -17,7 +17,7 @@ array:
   positionJitterSTD: 0.0
   phaseJitterSTD: 0.0
   failRate: 0.0
-  allowedElementCount: [25000]
+  allowedElementCount: [50000]
   allowedAspectRatio: [1.0]
   geometry: URA
   gainRange: [1.0, 1.0]
@@ -54,8 +54,8 @@ evolution:
   amplitudeMinSigmaScale: 0.1
   wideGridSizeStart: 128
   wideGridRampSteps: 4000
-  linearResponseChunkSize: 400000
-  wideResponseChunkSize: 400000
+  linearResponseChunkSize: 1000000000
+  wideResponseChunkSize: 1000000000
   lossType: HUBER
 
 loss:
