@@ -68,10 +68,9 @@ def sampleElementMask(
 
     # Array Failures
     if spec.failRate > 0:
-        failMask = (
-            torch.rand((batchSize, elementCount), device=device, generator=generator)
-            < float(spec.failRate)
-        )
+        failMask = torch.rand(
+            (batchSize, elementCount), device=device, generator=generator
+        ) < float(spec.failRate)
         mask = mask & (~failMask)
 
     # Sparsity (active fraction)
@@ -99,7 +98,9 @@ def sampleRandomWeights(
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     # Amplitude
-    amplitude = torch.rand((batchSize, elementCount), device=device, dtype=dtype, generator=generator)
+    amplitude = torch.rand(
+        (batchSize, elementCount), device=device, dtype=dtype, generator=generator
+    )
     amplitude = _normalize_amplitudes(amplitude, elementMask)
 
     # Phase
@@ -232,7 +233,7 @@ def sampleGain(
 
 def chooseOne(
     options,
-    device: torch.device = torch.device("cpu"),
+    device: torch.device = "cpu",
     generator: torch.Generator | None = None,
 ):
     index = torch.randint(0, len(options), (1,), device=device, generator=generator)

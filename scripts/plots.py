@@ -2,9 +2,9 @@ import matplotlib.cm as cm
 import matplotlib.colors as colors
 import matplotlib.pyplot as plt
 import torch
+from simulation.arraySim import arrayResponseBatch, arrayResponseSample, normalizePower, todB
 
 from .arrayBatch import ArrayBatch
-from .arraySimulation import arrayResponseBatch, arrayResponseSample, normalizePower, todB
 from .coordinateTransforms import mapLLAtoArrayAZEL
 from .targetSpec import TargetLike, fetchTargetSample
 
@@ -82,7 +82,14 @@ def plotArrayFactor(
         -plotRange / 2, plotRange / 2, 2 * plotResolution, device=batch.device, dtype=batch.dtype
     )
     elevationCutTensor = torch.tensor([elevationCutAngle], device=batch.device, dtype=batch.dtype)
-    azimuthResponse = arrayResponseSample(batch, sampleID, azimuthCutAxis, elevationCutTensor)
+    azimuthResponse = arrayResponseSample(
+        batch,
+        sampleID,
+        azimuthCutAxis,
+        elevationCutTensor,
+        dB=True,
+        normalize=True,
+    )
 
     ax1 = fig.add_subplot(131, projection=projection)
     azimuthCutAxis_cpu = azimuthCutAxis.detach().cpu().numpy()
@@ -103,7 +110,14 @@ def plotArrayFactor(
         -plotRange / 2, plotRange / 2, 2 * plotResolution, device=batch.device, dtype=batch.dtype
     )
     azimuthCutTensor = torch.tensor([azimuthCutAngle], device=batch.device, dtype=batch.dtype)
-    elevationResponse = arrayResponseSample(batch, sampleID, azimuthCutTensor, elevationCutAxis)
+    elevationResponse = arrayResponseSample(
+        batch,
+        sampleID,
+        azimuthCutTensor,
+        elevationCutAxis,
+        dB=True,
+        normalize=True,
+    )
 
     ax2 = fig.add_subplot(132, projection=projection)
     elevationCutAxis_cpu = elevationCutAxis.detach().cpu().numpy()
@@ -131,7 +145,7 @@ def plotArrayFactor(
 
         # Compute once; reuse pmax; avoid extra temporaries; avoid CPU scalar tensors
         fullResponse = arrayResponseSample(batch, sampleID, azimuthGrid, elevationGrid, dB=False)
-        fullPower = fullResponse.abs().square()
+        fullPower = fullResponse
         pmax = fullPower.max().clamp_min(1e-12)
 
         fullPowerNormalized = fullPower / pmax

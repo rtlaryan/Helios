@@ -7,11 +7,6 @@ This directory contains the machine learning pipelines for optimizing phased arr
 - `evolve.py`: The entry point and main logic for the evolutionary trainer. It orchestrates population generation, evaluation, rank-weighted parent selection, crossover, mutation, adaptive exploration schedules, checkpointing, and dataset logging.
 - `objective.py`: Defines the objective (loss/reward) functions used to evaluate the fitness of a specific array configuration. The current loss combines local target-map matching, wide-angle outside-support suppression, and a small efficiency regularizer.
 - `config.py`: Loads typed YAML run configs and resolves target sources.
-- `run.py`: CLI entrypoint for YAML-driven training runs.
-- `persistence.py`: Async-capable dataset and checkpoint writers.
-- `benchmark_evaluate.py`: Benchmarks evaluation timing/memory with and without the shared-target fast path.
-- `benchmark_chunk_sweep.py`: Sweeps response chunk sizes and measures end-to-end evaluation time for each candidate.
-- `profile_with_nsys.py`: Launches a benchmark under `nsys`, keeps the raw trace, and writes a JSON summary of NVTX-filtered GPU activity.
 
 ## YAML Workflow
 
@@ -30,34 +25,13 @@ Training can now be driven from a single YAML file that holds:
 Run a config with:
 
 ```bash
-conda run -n helios python -m train.run --config path/to/run.yaml
+conda run -n helios python -m train.evolve --config path/to/run.yaml
 ```
 
 `evolution.initialWeightsType` controls how the first population is initialized. Supported values are `random`, `uniform`, and `directed`. When `directed` is used, the training pipeline derives a steering center automatically from the resolved target map.
 
 The trainer now uses a clone/crossover/mutate/random population update. Parent choice is rank-weighted inside the configured parent pool. Random injection decays over time, the released budget is absorbed by mutation, and sigma values use both exponential decay and diversity-aware minimum floors. If progress stalls, the trainer temporarily boosts sigma values and random injection to re-open exploration. `wide_grid_size` can also ramp from a smaller start value to the final loss fidelity for faster early generations.
-Shared-target runs with homogeneous array geometry now reuse target projection/support work across the batch, and response chunk sizes can be capped explicitly or left on a conservative CUDA-aware auto mode. Inside the response kernel, Helios now uses one tiling heuristic: cap the reduction tile with `responseReductionTileCap`, then try to keep the full remaining batch in one tile before growing the grid tile.
-
-To tune chunk sizes on a specific config, run:
-
-```bash
-conda run -n helios python -m train.benchmark_chunk_sweep --config configs/evo.yaml
-```
-
-By default the script benchmarks a geometric sweep around the current configured chunk size. You can also provide explicit values with `--chunk-sizes 5e5 1e6 2e6 4e6`, or sweep only one knob with `--sweep linear` or `--sweep wide`.
-
-For Nsight Systems profiling, run the benchmark through the wrapper:
-
-```bash
-conda run -n helios python -m train.profile_with_nsys \
-  --output-prefix data/profiling/evo_linear \
-  -- \
-  python -m train.benchmark_chunk_sweep --config configs/evo.yaml --sweep linear --chunk-sizes 5e5
-```
-
-This keeps `data/profiling/evo_linear.nsys-rep`, the exported SQLite file, and writes `data/profiling/evo_linear_nsys_summary.json`. The chunk sweep and evaluation paths now emit NVTX ranges so `nsys stats --filter-nvtx ...` can isolate full runs, per-chunk candidates, per-iteration evaluations, and the major evaluation stages.
-
-The profiling history and current chunking conclusions are tracked in `docs/performance/array_response_tiling.md`.
+Shared-target evolution runs keep a single array/platform template across the batch, so the trainer can stay on the shared-grid response path. Response chunk sizes can be capped explicitly or left on the simulator's auto mode.
 
 ## Example Config
 
@@ -69,7 +43,7 @@ experiment:
   resume: true
   plotProjection: false
   tensorboard: true
-  targetMode: auto
+  targetMode: shared
 
 device:
   device: cpu
@@ -149,8 +123,7 @@ target:
 - `phaseMinSigmaScale` and `amplitudeMinSigmaScale` control the strength of those adaptive floors when enabled.
 - `stagnationWindow`, `sigmaBoostDuration`, `sigmaBoostMultiplier`, and `sigmaBoostRandomFraction` control stagnation-triggered exploration boosts.
 - `wideGridSizeStart` and `wideGridRampSteps` optionally ramp wide-angle fidelity from a coarse grid to the final `loss.wide_grid_size`.
-- `linearResponseChunkSize` and `wideResponseChunkSize` optionally cap evaluation chunk sizes. When left unset, Helios chooses conservative CUDA-aware defaults.
-- `responseReductionTileCap` limits the `Nc` reduction tile used by the response kernel. Once `Nc` is capped, Helios tries to keep the full remaining batch in one tile and only falls back to batch striping when necessary.
+- `linearResponseChunkSize` and `wideResponseChunkSize` optionally cap evaluation chunk sizes.
 
 ## Target Config Options
 
@@ -297,19 +270,12 @@ controller.train(
 )
 ```
 
-## Benchmarking
-
-Benchmark the active evaluation path with and without the shared-target fast path:
-
-```bash
-conda run -n helios python -m train.benchmark_evaluate --config configs/evo.yaml
-```
-
 ## Notes
 
 - `targetMode: auto` resolves by target type:
   - `TargetSpec` -> shared-target path
   - `TargetBatch` -> per-sample-target path
-- Shared-target evaluation avoids unnecessary batch expansion of shared grids.
+- `targetMode: shared` is the normal setting for evolution runs built from a single `TargetSpec`.
+- Shared-target evolution keeps one array/platform template across the batch, so the shared-grid response path stays active throughout the run.
 - Exact cloned elites are reused without rescoring when the fidelity schedule is unchanged for the next generation.
 - `projectResponseOnTarget(...)` now evaluates only the requested sample instead of the whole batch.

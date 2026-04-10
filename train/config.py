@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import random
 import re
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-import random
 from typing import Any, TypeVar
 
 import torch
@@ -11,21 +11,20 @@ import yaml
 from scripts.arraySpec import ArraySpec
 from scripts.target_generation import load_target_from_zones_json
 from scripts.targetSpec import TargetBatch, TargetLike, TargetSpec
-from train.evolve import EvolutionConfig
-from train.objective import LossConfig
-from train.runtime import (
+
+from train.evolve import (
     CheckpointConfig,
     DeviceConfig,
+    EvolutionConfig,
     ExperimentConfig,
     LoggingConfig,
     WorkerConfig,
 )
+from train.objective import LossConfig
 
 T = TypeVar("T")
 _INT_PATTERN = re.compile(r"^[+-]?\d+$")
-_FLOAT_PATTERN = re.compile(
-    r"^[+-]?(?:\d+\.\d*|\d+|\.\d+)(?:[eE][+-]?\d+)?$"
-)
+_FLOAT_PATTERN = re.compile(r"^[+-]?(?:\d+\.\d*|\d+|\.\d+)(?:[eE][+-]?\d+)?$")
 
 
 @dataclass
@@ -114,12 +113,13 @@ def loadRunConfig(path: str | Path) -> RunConfig:
 def buildRunConfig(payload: dict[str, Any]) -> RunConfig:
     evolutionPayload = _ensure_dict(payload.get("evolution"), "evolution")
     if "responseChunkShapeStrategy" in evolutionPayload:
-        raise ValueError(
-            "evolution.responseChunkShapeStrategy has been removed; "
-            "update the config to use responseReductionTileCap only"
-        )
+        raise ValueError("evolution.responseChunkShapeStrategy has been removed")
+    if "responseReductionTileCap" in evolutionPayload:
+        raise ValueError("evolution.responseReductionTileCap has been removed")
 
-    experiment = _coerce_dataclass(ExperimentConfig, _ensure_dict(payload.get("experiment"), "experiment"))
+    experiment = _coerce_dataclass(
+        ExperimentConfig, _ensure_dict(payload.get("experiment"), "experiment")
+    )
     device = _coerce_dataclass(DeviceConfig, _ensure_dict(payload.get("device"), "device"))
     array = _coerce_dataclass(ArraySpec, _ensure_dict(payload.get("array"), "array"))
     evolution = _coerce_dataclass(
@@ -192,8 +192,6 @@ def validateRunConfig(config: RunConfig) -> None:
         and config.evolution.wideResponseChunkSize <= 0
     ):
         raise ValueError("evolution.wideResponseChunkSize must be positive when set")
-    if config.evolution.responseReductionTileCap <= 0:
-        raise ValueError("evolution.responseReductionTileCap must be positive")
     if config.logging.datasetFlushEverySteps <= 0:
         raise ValueError("logging.datasetFlushEverySteps must be positive")
     if config.logging.responseCompactSize <= 0:
@@ -214,9 +212,7 @@ def validateRunConfig(config: RunConfig) -> None:
     if sum(targetSources) != 1:
         raise ValueError("target must define exactly one source mode")
     if config.target.selection not in {"first", "random_without_replacement"}:
-        raise ValueError(
-            "target.selection must be either 'first' or 'random_without_replacement'"
-        )
+        raise ValueError("target.selection must be either 'first' or 'random_without_replacement'")
     if config.target.selectionCount is not None and config.target.selectionCount <= 0:
         raise ValueError("target.selectionCount must be positive when set")
     if config.target.decimate <= 0:
@@ -295,7 +291,9 @@ def _loadTargetManifest(config: RunConfig) -> TargetBatch:
     targets = []
     for record in selectedRecords:
         if not isinstance(record, dict) or "path" not in record:
-            raise ValueError(f"target manifest {manifestPath} contains an invalid record: {record!r}")
+            raise ValueError(
+                f"target manifest {manifestPath} contains an invalid record: {record!r}"
+            )
         recordPath = _resolveManifestRecordPath(manifestPath, str(record["path"]))
         targets.append(
             _loadTargetReference(
@@ -350,9 +348,7 @@ def runConfigToDict(config: RunConfig) -> dict[str, Any]:
         "device": asdict(config.device),
         "array": asdict(config.array),
         "evolution": {
-            key: value
-            for key, value in asdict(config.evolution).items()
-            if key != "generator"
+            key: value for key, value in asdict(config.evolution).items() if key != "generator"
         },
         "loss": asdict(config.loss),
         "logging": asdict(config.logging),

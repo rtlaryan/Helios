@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
 import math
 import os
-from pathlib import Path
 import random
-from typing import Any
 import uuid
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import torch
 import yaml
-
 from scripts.target_generation import build_target_maps, build_target_spec
 from scripts.targetSpec import TargetSpec
 
@@ -154,31 +153,78 @@ def loadTargetCorpusConfig(path: str | Path) -> TargetCorpusConfig:
         weights={name: float(curriculum_weights.get(name, 0.0)) for name in CATEGORY_NAMES}
     )
 
-    single_circle_payload = _require_mapping(category_payload.get("single_circle"), "categories.single_circle")
-    irregular_payload = _require_mapping(category_payload.get("irregular_shape"), "categories.irregular_shape")
+    single_circle_payload = _require_mapping(
+        category_payload.get("single_circle"), "categories.single_circle"
+    )
+    irregular_payload = _require_mapping(
+        category_payload.get("irregular_shape"), "categories.irregular_shape"
+    )
     multibeam_payload = _require_mapping(category_payload.get("multibeam"), "categories.multibeam")
 
     categories = CategoryConfig(
         single_circle=SingleCircleConfig(
-            radiusRange=_float_range(single_circle_payload.get("radiusRange", [1.0, 4.0]), "categories.single_circle.radiusRange"),
-            rolloffRange=_float_range(single_circle_payload.get("rolloffRange", [0.5, 1.5]), "categories.single_circle.rolloffRange"),
-            peakDBRange=_float_range(single_circle_payload.get("peakDBRange", [-3.0, 0.0]), "categories.single_circle.peakDBRange"),
+            radiusRange=_float_range(
+                single_circle_payload.get("radiusRange", [1.0, 4.0]),
+                "categories.single_circle.radiusRange",
+            ),
+            rolloffRange=_float_range(
+                single_circle_payload.get("rolloffRange", [0.5, 1.5]),
+                "categories.single_circle.rolloffRange",
+            ),
+            peakDBRange=_float_range(
+                single_circle_payload.get("peakDBRange", [-3.0, 0.0]),
+                "categories.single_circle.peakDBRange",
+            ),
         ),
         irregular_shape=IrregularShapeConfig(
-            componentCountRange=_int_range(irregular_payload.get("componentCountRange", [2, 4]), "categories.irregular_shape.componentCountRange"),
-            circleComponentProbability=float(irregular_payload.get("circleComponentProbability", 0.5)),
-            radiusRange=_float_range(irregular_payload.get("radiusRange", [1.0, 3.0]), "categories.irregular_shape.radiusRange"),
-            polygonRadiusRange=_float_range(irregular_payload.get("polygonRadiusRange", [1.5, 4.0]), "categories.irregular_shape.polygonRadiusRange"),
-            polygonVertexCountRange=_int_range(irregular_payload.get("polygonVertexCountRange", [3, 6]), "categories.irregular_shape.polygonVertexCountRange"),
-            componentJitterRange=_float_range(irregular_payload.get("componentJitterRange", [1.0, 5.0]), "categories.irregular_shape.componentJitterRange"),
-            rolloffRange=_float_range(irregular_payload.get("rolloffRange", [0.5, 1.5]), "categories.irregular_shape.rolloffRange"),
-            peakDBRange=_float_range(irregular_payload.get("peakDBRange", [-6.0, 0.0]), "categories.irregular_shape.peakDBRange"),
+            componentCountRange=_int_range(
+                irregular_payload.get("componentCountRange", [2, 4]),
+                "categories.irregular_shape.componentCountRange",
+            ),
+            circleComponentProbability=float(
+                irregular_payload.get("circleComponentProbability", 0.5)
+            ),
+            radiusRange=_float_range(
+                irregular_payload.get("radiusRange", [1.0, 3.0]),
+                "categories.irregular_shape.radiusRange",
+            ),
+            polygonRadiusRange=_float_range(
+                irregular_payload.get("polygonRadiusRange", [1.5, 4.0]),
+                "categories.irregular_shape.polygonRadiusRange",
+            ),
+            polygonVertexCountRange=_int_range(
+                irregular_payload.get("polygonVertexCountRange", [3, 6]),
+                "categories.irregular_shape.polygonVertexCountRange",
+            ),
+            componentJitterRange=_float_range(
+                irregular_payload.get("componentJitterRange", [1.0, 5.0]),
+                "categories.irregular_shape.componentJitterRange",
+            ),
+            rolloffRange=_float_range(
+                irregular_payload.get("rolloffRange", [0.5, 1.5]),
+                "categories.irregular_shape.rolloffRange",
+            ),
+            peakDBRange=_float_range(
+                irregular_payload.get("peakDBRange", [-6.0, 0.0]),
+                "categories.irregular_shape.peakDBRange",
+            ),
         ),
         multibeam=MultibeamConfig(
-            beamCountRange=_int_range(multibeam_payload.get("beamCountRange", [2, 4]), "categories.multibeam.beamCountRange"),
-            radiusRange=_float_range(multibeam_payload.get("radiusRange", [1.0, 3.0]), "categories.multibeam.radiusRange"),
-            rolloffRange=_float_range(multibeam_payload.get("rolloffRange", [0.5, 1.5]), "categories.multibeam.rolloffRange"),
-            peakDBRange=_float_range(multibeam_payload.get("peakDBRange", [-3.0, 0.0]), "categories.multibeam.peakDBRange"),
+            beamCountRange=_int_range(
+                multibeam_payload.get("beamCountRange", [2, 4]),
+                "categories.multibeam.beamCountRange",
+            ),
+            radiusRange=_float_range(
+                multibeam_payload.get("radiusRange", [1.0, 3.0]), "categories.multibeam.radiusRange"
+            ),
+            rolloffRange=_float_range(
+                multibeam_payload.get("rolloffRange", [0.5, 1.5]),
+                "categories.multibeam.rolloffRange",
+            ),
+            peakDBRange=_float_range(
+                multibeam_payload.get("peakDBRange", [-3.0, 0.0]),
+                "categories.multibeam.peakDBRange",
+            ),
             minSeparationDeg=float(multibeam_payload.get("minSeparationDeg", 5.0)),
             placementAttempts=int(multibeam_payload.get("placementAttempts", 64)),
         ),
@@ -325,7 +371,9 @@ def _sample_irregular_zones(
     config: IrregularShapeConfig,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     component_count = _sample_int(config.componentCountRange, rng)
-    base_radius = max(config.radiusRange[1], config.polygonRadiusRange[1], config.componentJitterRange[1])
+    base_radius = max(
+        config.radiusRange[1], config.polygonRadiusRange[1], config.componentJitterRange[1]
+    )
     anchor_lat = _sample_center(grid.latRange, base_radius, rng)
     anchor_lon = _sample_center(grid.lonRange, base_radius, rng)
 
@@ -377,7 +425,9 @@ def _sample_irregular_zones(
     }
 
 
-def _great_circle_like_distance(point_a: tuple[float, float], point_b: tuple[float, float]) -> float:
+def _great_circle_like_distance(
+    point_a: tuple[float, float], point_b: tuple[float, float]
+) -> float:
     mean_lat = math.radians((point_a[0] + point_b[0]) / 2.0)
     dlat = point_a[0] - point_b[0]
     dlon = (point_a[1] - point_b[1]) * math.cos(mean_lat)
@@ -482,7 +532,9 @@ def _generate_target_for_category(
         )
         metadata: dict[str, Any] = {"beamCount": 1}
     elif category == "irregular_shape":
-        zones, metadata = _sample_irregular_zones(rng, config.grid, config.categories.irregular_shape)
+        zones, metadata = _sample_irregular_zones(
+            rng, config.grid, config.categories.irregular_shape
+        )
     elif category == "multibeam":
         zones, metadata = _sample_multibeam_zones(rng, config.grid, config.categories.multibeam)
     else:
@@ -634,12 +686,25 @@ def generateTargetCorpus(
                 records_by_index[index] = record
                 progress_bar.update(1)
         else:
-            with ProcessPoolExecutor(max_workers=worker_count) as executor:
-                futures = [executor.submit(_generate_and_save_target_star, args) for args in job_args]
-                for future in as_completed(futures):
-                    index, record = future.result()
-                    records_by_index[index] = record
-                    progress_bar.update(1)
+            executor_cls = ProcessPoolExecutor
+            try:
+                with executor_cls(max_workers=worker_count) as executor:
+                    futures = [
+                        executor.submit(_generate_and_save_target_star, args) for args in job_args
+                    ]
+                    for future in as_completed(futures):
+                        index, record = future.result()
+                        records_by_index[index] = record
+                        progress_bar.update(1)
+            except (NotImplementedError, OSError, PermissionError):
+                with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                    futures = [
+                        executor.submit(_generate_and_save_target_star, args) for args in job_args
+                    ]
+                    for future in as_completed(futures):
+                        index, record = future.result()
+                        records_by_index[index] = record
+                        progress_bar.update(1)
     finally:
         progress_bar.close()
 

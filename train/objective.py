@@ -1,26 +1,12 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
-import time
 
 import torch
 import torch.nn.functional as F
 from scripts.arrayBatch import ArrayBatch
-from scripts.arraySimulation import (
-    arrayResponseBatch,
-    arrayResponseBatchCompiled,
-    resolveResponseChunkSize,
-)
 from scripts.coordinateTransforms import LLAtoECEF, getECEFtoENUMapping, mapLLAtoArrayAZEL
 from scripts.targetSpec import TargetBatch, TargetLike, TargetSpec
-from train.nvtx import (
-    EVALUATE_LINEAR_RESPONSE_RANGE,
-    EVALUATE_LOSS_ASSEMBLY_RANGE,
-    EVALUATE_SUPPORT_MASK_RANGE,
-    EVALUATE_TARGET_PROJECTION_RANGE,
-    EVALUATE_TOTAL_RANGE,
-    EVALUATE_WIDE_RESPONSE_RANGE,
-    nvtx_range,
-)
+from simulation.arraySim import arrayResponseBatch, arrayResponseBatchSharedGrid
 
 LossType = Literal["MSE", "HUBER"]  # kept for backward compat, unused internally
 TargetMode = Literal["auto", "shared", "per_sample"]
@@ -48,48 +34,6 @@ class TargetPrep:
 
 
 @dataclass
-class EvaluationDiagnostics:
-    targetProjectionMS: float = 0.0
-    linearResponseMS: float = 0.0
-    wideResponseMS: float = 0.0
-    supportMaskMS: float = 0.0
-    totalMS: float = 0.0
-    gpuMaxMemoryMB: float | None = None
-    usedSharedTargetFastPath: bool = False
-    linearResponseChunkSize: int | None = None
-    wideResponseChunkSize: int | None = None
-
-    @classmethod
-    def zeroedFrom(cls, other: "EvaluationDiagnostics") -> "EvaluationDiagnostics":
-        return cls(
-            usedSharedTargetFastPath=other.usedSharedTargetFastPath,
-            linearResponseChunkSize=other.linearResponseChunkSize,
-            wideResponseChunkSize=other.wideResponseChunkSize,
-        )
-
-    @classmethod
-    def merge(cls, diagnostics: list["EvaluationDiagnostics"]) -> "EvaluationDiagnostics":
-        gpuPeaks = [value.gpuMaxMemoryMB for value in diagnostics if value.gpuMaxMemoryMB is not None]
-        return cls(
-            targetProjectionMS=sum(value.targetProjectionMS for value in diagnostics),
-            linearResponseMS=sum(value.linearResponseMS for value in diagnostics),
-            wideResponseMS=sum(value.wideResponseMS for value in diagnostics),
-            supportMaskMS=sum(value.supportMaskMS for value in diagnostics),
-            totalMS=sum(value.totalMS for value in diagnostics),
-            gpuMaxMemoryMB=max(gpuPeaks) if gpuPeaks else None,
-            usedSharedTargetFastPath=any(value.usedSharedTargetFastPath for value in diagnostics),
-            linearResponseChunkSize=next(
-                (value.linearResponseChunkSize for value in reversed(diagnostics) if value.linearResponseChunkSize is not None),
-                None,
-            ),
-            wideResponseChunkSize=next(
-                (value.wideResponseChunkSize for value in reversed(diagnostics) if value.wideResponseChunkSize is not None),
-                None,
-            ),
-        )
-
-
-@dataclass
 class BatchEvaluation:
     totalLoss: torch.Tensor
     shapeLoss: torch.Tensor
@@ -98,11 +42,12 @@ class BatchEvaluation:
     linearResponse: torch.Tensor
     targetAZEL: tuple[torch.Tensor, torch.Tensor]
     targetMode: TargetMode
-    diagnostics: EvaluationDiagnostics = field(default_factory=EvaluationDiagnostics)
 
 
 _SHARED_TARGET_CACHE: dict[tuple[int | float, ...], TargetPrep] = {}
-_WIDE_GRID_CACHE: dict[tuple[torch.device, torch.dtype, int], tuple[torch.Tensor, torch.Tensor]] = {}
+_WIDE_GRID_CACHE: dict[
+    tuple[torch.device, torch.dtype, int], tuple[torch.Tensor, torch.Tensor]
+] = {}
 
 
 def _sharedTargetCacheKey(target: TargetSpec, dtype: torch.dtype) -> tuple[int | float, ...]:
@@ -225,16 +170,12 @@ def _wideAreaResponse(
     batch: ArrayBatch,
     gridSize: int,
     chunkSize: int | None = None,
-    reductionTileCap: int = 256,
-    useCompiledArrayResponse: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     wideAZGrid, wideELGrid = _getWideGrid(batch.device, batch.dtype, gridSize)
-    responseBatchFn = arrayResponseBatchCompiled if useCompiledArrayResponse else arrayResponseBatch
-    wideResponse = responseBatchFn(
+    wideResponse = arrayResponseBatchSharedGrid(
         batch,
         (wideAZGrid, wideELGrid),
         chunkSize=chunkSize,
-        reductionTileCap=reductionTileCap,
     )
     return wideResponse, wideAZGrid, wideELGrid
 
@@ -300,8 +241,10 @@ def _rasterizeWideSupportMask(
     elIdx = ((flatEL - elMin) * elScale).round().long().clamp(0, gridSizeEL - 1)
 
     validMask = (
-        prep.importanceFlat.expand_as(flatAZ) > 0
-    ) & torch.isfinite(flatAZ) & torch.isfinite(flatEL)
+        (prep.importanceFlat.expand_as(flatAZ) > 0)
+        & torch.isfinite(flatAZ)
+        & torch.isfinite(flatEL)
+    )
 
     if validMask.any():
         sampleIdx = torch.arange(batchSize, device=flatAZ.device).unsqueeze(1).expand_as(validMask)
@@ -313,12 +256,15 @@ def _rasterizeWideSupportMask(
 
     if dilationCells > 0:
         kernelSize = 2 * dilationCells + 1
-        supportMask = F.max_pool2d(
-            supportMask.unsqueeze(1).to(dtype=wideAZGrid.dtype),
-            kernel_size=kernelSize,
-            stride=1,
-            padding=dilationCells,
-        ).squeeze(1) > 0
+        supportMask = (
+            F.max_pool2d(
+                supportMask.unsqueeze(1).to(dtype=wideAZGrid.dtype),
+                kernel_size=kernelSize,
+                stride=1,
+                padding=dilationCells,
+            ).squeeze(1)
+            > 0
+        )
 
     return supportMask
 
@@ -344,153 +290,92 @@ def evaluateBatch(
     logTerms: bool = False,
     linearResponseChunkSize: int | None = None,
     wideResponseChunkSize: int | None = None,
-    responseReductionTileCap: int = 256,
-    useCompiledArrayResponse: bool = False,
     allowSharedTargetFastPath: bool = True,
 ) -> BatchEvaluation:
-    nvtxEnabled = batch.device.type == "cuda"
-    with nvtx_range(EVALUATE_TOTAL_RANGE, enabled=nvtxEnabled):
-        totalStart = time.perf_counter()
-        if nvtxEnabled:
-            torch.cuda.reset_peak_memory_stats(batch.device)
+    resolvedMode = _resolveTargetMode(target, targetMode)
+    target = target.to(batch.device, batch.dtype)
+    prep = _prepareTarget(target, params, resolvedMode)
+    useSharedTargetFastPath = (
+        allowSharedTargetFastPath
+        and resolvedMode == "shared"
+        and _canUseSharedTargetFastPath(batch, prep)
+    )
 
-        resolvedMode = _resolveTargetMode(target, targetMode)
-        target = target.to(batch.device, batch.dtype)
-        prep = _prepareTarget(target, params, resolvedMode)
-
-        linearGridSize = int(prep.powerFlat.shape[-1])
-        resolvedLinearChunkSize = resolveResponseChunkSize(
-            batchSize=batch.batchSize,
-            elementCount=batch.N,
-            gridSize=linearGridSize,
-            realDtype=batch.dtype,
-            device=batch.device,
-            requestedChunkSize=linearResponseChunkSize,
+    if useSharedTargetFastPath:
+        sharedAZ, sharedEL = _sharedTargetAZELForHomogeneousBatch(batch, prep)
+        targetAZEL = (
+            sharedAZ.unsqueeze(0).expand(batch.batchSize, -1),
+            sharedEL.unsqueeze(0).expand(batch.batchSize, -1),
         )
-        resolvedWideChunkSize = resolveResponseChunkSize(
-            batchSize=batch.batchSize,
-            elementCount=batch.N,
-            gridSize=int(params.wide_grid_size * params.wide_grid_size),
-            realDtype=batch.dtype,
-            device=batch.device,
-            requestedChunkSize=wideResponseChunkSize,
+        linearResponse = arrayResponseBatchSharedGrid(
+            batch,
+            (sharedAZ, sharedEL),
+            chunkSize=linearResponseChunkSize,
+        ).reshape(batch.batchSize, *prep.targetShape)
+    else:
+        targetAZEL = mapLLAtoArrayAZEL(batch, prep.targetCoordinates)
+        linearResponse = arrayResponseBatch(
+            batch,
+            targetAZEL,
+            chunkSize=linearResponseChunkSize,
+        ).reshape(batch.batchSize, *prep.targetShape)
+
+    wideResponse, wideAZGrid, wideELGrid = _wideAreaResponse(
+        batch,
+        gridSize=params.wide_grid_size,
+        chunkSize=wideResponseChunkSize,
+    )
+
+    if useSharedTargetFastPath:
+        sharedSupportMask = _rasterizeWideSupportMask(
+            targetAZEL=(targetAZEL[0][:1], targetAZEL[1][:1]),
+            prep=prep,
+            wideAZGrid=wideAZGrid,
+            wideELGrid=wideELGrid,
+            dilationCells=params.wide_support_dilation_cells,
         )
-
-        usedSharedTargetFastPath = False
-        projectionStart = time.perf_counter()
-        with nvtx_range(EVALUATE_TARGET_PROJECTION_RANGE, enabled=nvtxEnabled):
-            if (
-                allowSharedTargetFastPath
-                and resolvedMode == "shared"
-                and _canUseSharedTargetFastPath(batch, prep)
-            ):
-                sharedAZ, sharedEL = _sharedTargetAZELForHomogeneousBatch(batch, prep)
-                targetAZEL = (
-                    sharedAZ.unsqueeze(0).expand(batch.batchSize, -1),
-                    sharedEL.unsqueeze(0).expand(batch.batchSize, -1),
-                )
-                linearResponseInput = (sharedAZ, sharedEL)
-                usedSharedTargetFastPath = True
-            else:
-                targetAZEL = mapLLAtoArrayAZEL(batch, prep.targetCoordinates)
-                linearResponseInput = targetAZEL
-        targetProjectionMS = (time.perf_counter() - projectionStart) * 1000.0
-
-        linearResponseStart = time.perf_counter()
-        with nvtx_range(EVALUATE_LINEAR_RESPONSE_RANGE, enabled=nvtxEnabled):
-            responseBatchFn = (
-                arrayResponseBatchCompiled if useCompiledArrayResponse else arrayResponseBatch
-            )
-            linearResponse = responseBatchFn(
-                batch,
-                linearResponseInput,
-                chunkSize=resolvedLinearChunkSize,
-                reductionTileCap=responseReductionTileCap,
-            ).reshape(batch.batchSize, *prep.targetShape)
-        linearResponseMS = (time.perf_counter() - linearResponseStart) * 1000.0
-
-        wideResponseStart = time.perf_counter()
-        with nvtx_range(EVALUATE_WIDE_RESPONSE_RANGE, enabled=nvtxEnabled):
-            wideResponse, wideAZGrid, wideELGrid = _wideAreaResponse(
-                batch,
-                gridSize=params.wide_grid_size,
-                chunkSize=resolvedWideChunkSize,
-                reductionTileCap=responseReductionTileCap,
-                useCompiledArrayResponse=useCompiledArrayResponse,
-            )
-        wideResponseMS = (time.perf_counter() - wideResponseStart) * 1000.0
-
-        supportMaskStart = time.perf_counter()
-        with nvtx_range(EVALUATE_SUPPORT_MASK_RANGE, enabled=nvtxEnabled):
-            if usedSharedTargetFastPath:
-                sharedSupportMask = _rasterizeWideSupportMask(
-                    targetAZEL=(targetAZEL[0][:1], targetAZEL[1][:1]),
-                    prep=prep,
-                    wideAZGrid=wideAZGrid,
-                    wideELGrid=wideELGrid,
-                    dilationCells=params.wide_support_dilation_cells,
-                )
-                wideSupportMask = sharedSupportMask.expand(batch.batchSize, -1, -1)
-            else:
-                wideSupportMask = _rasterizeWideSupportMask(
-                    targetAZEL=targetAZEL,
-                    prep=prep,
-                    wideAZGrid=wideAZGrid,
-                    wideELGrid=wideELGrid,
-                    dilationCells=params.wide_support_dilation_cells,
-                )
-        supportMaskMS = (time.perf_counter() - supportMaskStart) * 1000.0
-
-        with nvtx_range(EVALUATE_LOSS_ASSEMBLY_RANGE, enabled=nvtxEnabled):
-            globalPeak = wideResponse.flatten(1).amax(dim=-1).clamp_min(1e-10)
-            normalizedShapeResponse = linearResponse / globalPeak.view(
-                batch.batchSize, *([1] * len(prep.targetShape))
-            )
-
-            shapeLoss = _shapeFidelityLoss(normalizedShapeResponse, prep)
-            efficiencyLoss = _powerEfficiencyLoss(linearResponse, prep)
-            wideSupportLoss = _wideSupportLossFromResponse(
-                wideResponse=wideResponse,
-                globalPeak=globalPeak,
-                supportMask=wideSupportMask,
-            )
-            totalLoss = (
-                params.w_shape * shapeLoss
-                + params.w_eff * efficiencyLoss
-                + params.w_wide * wideSupportLoss
-            )
-
-        if logTerms:
-            print(
-                f"shape={params.w_shape * shapeLoss.mean().item():.4f} | "
-                f"efficiency={params.w_eff * efficiencyLoss.mean().item():.4f} | "
-                f"wide={params.w_wide * wideSupportLoss.mean().item():.4f}"
-            )
-
-        gpuMaxMemoryMB = None
-        if nvtxEnabled:
-            gpuMaxMemoryMB = torch.cuda.max_memory_allocated(batch.device) / (1024**2)
-
-        return BatchEvaluation(
-            totalLoss=totalLoss,
-            shapeLoss=shapeLoss,
-            efficiencyLoss=efficiencyLoss,
-            wideSupportLoss=wideSupportLoss,
-            linearResponse=linearResponse,
+        wideSupportMask = sharedSupportMask.expand(batch.batchSize, -1, -1)
+    else:
+        wideSupportMask = _rasterizeWideSupportMask(
             targetAZEL=targetAZEL,
-            targetMode=resolvedMode,
-            diagnostics=EvaluationDiagnostics(
-                targetProjectionMS=targetProjectionMS,
-                linearResponseMS=linearResponseMS,
-                wideResponseMS=wideResponseMS,
-                supportMaskMS=supportMaskMS,
-                totalMS=(time.perf_counter() - totalStart) * 1000.0,
-                gpuMaxMemoryMB=gpuMaxMemoryMB,
-                usedSharedTargetFastPath=usedSharedTargetFastPath,
-                linearResponseChunkSize=resolvedLinearChunkSize,
-                wideResponseChunkSize=resolvedWideChunkSize,
-            ),
+            prep=prep,
+            wideAZGrid=wideAZGrid,
+            wideELGrid=wideELGrid,
+            dilationCells=params.wide_support_dilation_cells,
         )
+
+    globalPeak = wideResponse.flatten(1).amax(dim=-1).clamp_min(1e-10)
+    normalizedShapeResponse = linearResponse / globalPeak.view(
+        batch.batchSize, *([1] * len(prep.targetShape))
+    )
+
+    shapeLoss = _shapeFidelityLoss(normalizedShapeResponse, prep)
+    efficiencyLoss = _powerEfficiencyLoss(linearResponse, prep)
+    wideSupportLoss = _wideSupportLossFromResponse(
+        wideResponse=wideResponse,
+        globalPeak=globalPeak,
+        supportMask=wideSupportMask,
+    )
+    totalLoss = (
+        params.w_shape * shapeLoss + params.w_eff * efficiencyLoss + params.w_wide * wideSupportLoss
+    )
+
+    if logTerms:
+        print(
+            f"shape={params.w_shape * shapeLoss.mean().item():.4f} | "
+            f"efficiency={params.w_eff * efficiencyLoss.mean().item():.4f} | "
+            f"wide={params.w_wide * wideSupportLoss.mean().item():.4f}"
+        )
+
+    return BatchEvaluation(
+        totalLoss=totalLoss,
+        shapeLoss=shapeLoss,
+        efficiencyLoss=efficiencyLoss,
+        wideSupportLoss=wideSupportLoss,
+        linearResponse=linearResponse,
+        targetAZEL=targetAZEL,
+        targetMode=resolvedMode,
+    )
 
 
 def batchLoss(
@@ -502,8 +387,6 @@ def batchLoss(
     targetMode: TargetMode = "auto",
     linearResponseChunkSize: int | None = None,
     wideResponseChunkSize: int | None = None,
-    responseReductionTileCap: int = 256,
-    useCompiledArrayResponse: bool = False,
     allowSharedTargetFastPath: bool = True,
 ) -> torch.Tensor:
     del lossType
@@ -515,7 +398,5 @@ def batchLoss(
         logTerms=logTerms,
         linearResponseChunkSize=linearResponseChunkSize,
         wideResponseChunkSize=wideResponseChunkSize,
-        responseReductionTileCap=responseReductionTileCap,
-        useCompiledArrayResponse=useCompiledArrayResponse,
         allowSharedTargetFastPath=allowSharedTargetFastPath,
     ).totalLoss

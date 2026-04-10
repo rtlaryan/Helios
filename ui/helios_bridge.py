@@ -1,7 +1,7 @@
 """
 helios_bridge.py
 Converts between REST JSON payloads and native Helios dataclasses.
-All imports are from the existing scripts/ package — nothing is copied.
+All imports are from the existing Helios modules; nothing is copied.
 """
 
 from __future__ import annotations
@@ -10,12 +10,12 @@ import math
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 from scripts.arrayBatch import ArrayBatch
-from scripts.arraySimulation import arrayResponseCore, arrayResponseSample
 from scripts.arraySpec import ArraySpec
 from scripts.coordinateTransforms import LLAtoECEF, mapLLAtoArrayAZEL
-from scripts.target_generation import build_target_maps, build_target_spec
+from simulation.arraySim import arrayResponseSample
 
 # Make sure project root is on the path so `scripts` is importable
 _ROOT = Path(__file__).parent.parent
@@ -79,11 +79,33 @@ def compute_pattern_2d(batch: ArrayBatch, sample_id: int = 0, resolution: int = 
 
     az_axis = torch.linspace(-math.pi, math.pi, resolution * 2, device=dev, dtype=dtype)
     el_zero = torch.zeros(1, device=dev, dtype=dtype)
-    az_response = arrayResponseSample(batch, sample_id, az_axis, el_zero).cpu().tolist()
+    az_response = (
+        arrayResponseSample(
+            batch,
+            sample_id,
+            az_axis,
+            el_zero,
+            dB=True,
+            normalize=True,
+        )
+        .cpu()
+        .tolist()
+    )
 
     el_axis = torch.linspace(-math.pi / 2, math.pi / 2, resolution, device=dev, dtype=dtype)
     az_zero = torch.zeros(1, device=dev, dtype=dtype)
-    el_response = arrayResponseSample(batch, sample_id, az_zero, el_axis).cpu().tolist()
+    el_response = (
+        arrayResponseSample(
+            batch,
+            sample_id,
+            az_zero,
+            el_axis,
+            dB=True,
+            normalize=True,
+        )
+        .cpu()
+        .tolist()
+    )
 
     el_axis_display = el_axis
 
@@ -94,7 +116,7 @@ def compute_pattern_2d(batch: ArrayBatch, sample_id: int = 0, resolution: int = 
     az_g, el_g = torch.meshgrid(az_v, el_v, indexing="ij")
 
     raw = arrayResponseSample(batch, sample_id, az_g, el_g, dB=False)
-    power = raw.abs().square()
+    power = raw
     pmax = power.max().clamp_min(1e-12)
     norm = (power / pmax).clamp_min(1e-12)
     db_grid = (10.0 * torch.log10(norm)).cpu()
@@ -148,15 +170,13 @@ def compute_ground_projection(
     )
 
     az, el = mapLLAtoArrayAZEL(sub_batch, coords)
-    response = arrayResponseCore(
-        sub_batch.elementLocalPosition,
-        sub_batch.weights,
-        sub_batch.wavelength,
+    response = arrayResponseSample(
+        sub_batch,
+        0,
         az[0],
         el[0],
-        sub_batch.gain,
         dB=True,
-    )[0]
+    )
 
     # Geometric horizon masking:
     # A point on Earth's surface is visible from the satellite iff the dot product

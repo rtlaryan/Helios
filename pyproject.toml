@@ -34,6 +34,8 @@ docstring-code-format = true
 
 [tool.ruff.lint.per-file-ignores]
 "scripts/phasedArray_old.py" = ["ALL"]
+"simulation/simulationExperiments.ipynb" = ["ALL"]
+"*.ipynb" = ["ALL"]
 
 
 # -------------------------

@@ -5,14 +5,18 @@ from pathlib import Path
 import pytest
 import torch
 import yaml
-
 from generation.target_corpus import CATEGORY_NAMES, generateTargetCorpus
 from scripts.arraySpec import ArraySpec
 from scripts.targetSpec import TargetBatch, TargetSpec
 from train.config import buildRunConfig, resolveTarget
-from train.evolve import EvolutionConfig, EvolutionController
+from train.evolve import (
+    CheckpointConfig,
+    EvolutionConfig,
+    EvolutionController,
+    LoggingConfig,
+    WorkerConfig,
+)
 from train.objective import LossConfig
-from train.runtime import CheckpointConfig, LoggingConfig, WorkerConfig
 
 
 def make_array_spec() -> ArraySpec:
@@ -130,7 +134,9 @@ def test_generate_target_corpus_is_deterministic_and_curriculum_driven(tmp_path:
         torch.testing.assert_close(target_a.hotspotCoordinates, target_b.hotspotCoordinates)
 
 
-def test_generate_target_corpus_matches_single_worker_output_when_parallelized(tmp_path: Path) -> None:
+def test_generate_target_corpus_matches_single_worker_output_when_parallelized(
+    tmp_path: Path,
+) -> None:
     config_path_single = tmp_path / "targets_single.yaml"
     config_path_multi = tmp_path / "targets_multi.yaml"
     output_root_single = tmp_path / "corpus_single"

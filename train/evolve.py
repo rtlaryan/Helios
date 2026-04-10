@@ -1,45 +1,80 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-from pathlib import Path
+import argparse
+import multiprocessing as mp
 import re
 import shutil
-from typing import Any
+from dataclasses import dataclass, field, replace
+from multiprocessing.process import BaseProcess
+from pathlib import Path
+from queue import Empty
+from typing import Any, Literal
 
 import torch
 import torch.nn.functional as F
 import yaml
 from scripts.arrayBatch import ArrayBatch, merge
 from scripts.arraySpec import ArraySpec
-from scripts.batchFactory import generateBatch
+from scripts.batchFactory import (
+    generateBatch,
+    sampleDirectedWeights,
+    sampleRandomWeights,
+    sampleUniformWeights,
+)
 from scripts.plots import projectResponseOnTarget
 from scripts.targetSpec import (
-    TargetBatch,
     TargetLike,
     TargetSpec,
     fetchTargetSample,
     inferTargetCenter,
     serializeTarget,
 )
-from torch.utils.tensorboard import SummaryWriter
-from tqdm.auto import tqdm
 
 from train.objective import (
     BatchEvaluation,
-    EvaluationDiagnostics,
     LossConfig,
     LossType,
     TargetMode,
     evaluateBatch,
 )
-from train.persistence import AsyncWriterPool
-from train.runtime import CheckpointConfig, LoggingConfig, WorkerConfig
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ModuleNotFoundError:
+
+    class SummaryWriter:  # type: ignore[override]
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def add_scalar(self, *args, **kwargs) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+
+try:
+    from tqdm.auto import tqdm
+except ModuleNotFoundError:
+
+    class _TqdmFallback:
+        def __init__(self, iterable, *args, **kwargs) -> None:
+            self._iterable = iterable
+
+        def __iter__(self):
+            return iter(self._iterable)
+
+        def set_postfix(self, *args, **kwargs) -> None:
+            pass
+
+    def tqdm(iterable, *args, **kwargs):  # type: ignore[override]
+        return _TqdmFallback(iterable, *args, **kwargs)
 
 
 _INT_PATTERN = re.compile(r"^[+-]?\d+$")
-_FLOAT_PATTERN = re.compile(
-    r"^[+-]?(?:\d+\.\d*|\d+|\.\d+)(?:[eE][+-]?\d+)?$"
-)
+_FLOAT_PATTERN = re.compile(r"^[+-]?(?:\d+\.\d*|\d+|\.\d+)(?:[eE][+-]?\d+)?$")
+LogMode = Literal["off", "metrics_only", "dataset_compact", "dataset_full"]
+CheckpointMode = Literal["off", "periodic"]
 _RESUME_MUTABLE_EVOLUTION_KEYS = {
     "initialWeightsType",
     "phaseSigma",
@@ -63,7 +98,6 @@ _RESUME_MUTABLE_EVOLUTION_KEYS = {
     "wideGridRampSteps",
     "linearResponseChunkSize",
     "wideResponseChunkSize",
-    "responseReductionTileCap",
 }
 _RESUME_MUTABLE_EXPERIMENT_KEYS = {
     "resume",
@@ -71,12 +105,118 @@ _RESUME_MUTABLE_EXPERIMENT_KEYS = {
 }
 
 
+def _writerWorker(queue, timeoutSeconds: float = 0.2) -> None:
+    while True:
+        try:
+            task = queue.get(timeout=timeoutSeconds)
+        except Empty:
+            continue
+
+        if task is None:
+            queue.task_done()
+            break
+
+        pathString, payload = task
+        path = Path(pathString)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(payload, path)
+        queue.task_done()
+
+
+class AsyncWriterPool:
+    def __init__(self, workerCount: int, queueSize: int, enabled: bool = True) -> None:
+        self.enabled = enabled and workerCount > 0
+        self.workerCount = workerCount
+        self.queueSize = queueSize
+        self.processes: list[BaseProcess] = []
+        self.queue = None
+
+        if not self.enabled:
+            return
+
+        method = "fork" if "fork" in mp.get_all_start_methods() else "spawn"
+        self.context = mp.get_context(method)
+        self.queue = self.context.JoinableQueue(maxsize=queueSize)
+
+        for _ in range(workerCount):
+            process = self.context.Process(target=_writerWorker, args=(self.queue,))
+            process.start()
+            self.processes.append(process)
+
+    def submit(self, path: str | Path, payload: Any) -> None:
+        if not self.enabled:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            torch.save(payload, path)
+            return
+
+        assert self.queue is not None
+        self.queue.put((str(path), payload), block=True)
+
+    def flush(self) -> None:
+        if not self.enabled:
+            return
+
+        assert self.queue is not None
+        self.queue.join()
+
+    def close(self) -> None:
+        if not self.enabled:
+            return
+
+        assert self.queue is not None
+        for _ in self.processes:
+            self.queue.put(None, block=True)
+        self.queue.join()
+
+        for process in self.processes:
+            process.join()
+
+        self.processes.clear()
+        self.queue.close()
+        self.queue = None
+
+
+@dataclass
+class ExperimentConfig:
+    name: str = "evo_1"
+    logDir: str | Path | None = "runs"
+    archiveDir: str | Path = "data/archive"
+    resume: bool = True
+    plotProjection: bool = False
+    tensorboard: bool = True
+    targetMode: TargetMode = "auto"
+
+
+@dataclass
+class DeviceConfig:
+    device: str = "cpu"
+    dtype: str = "float32"
+
+
+@dataclass
+class LoggingConfig:
+    logMode: LogMode = "metrics_only"
+    datasetFlushEverySteps: int = 10
+    responseCompactSize: int = 64
+
+
+@dataclass
+class CheckpointConfig:
+    checkpointMode: CheckpointMode = "periodic"
+    checkpointEverySteps: int = 100
+
+
+@dataclass
+class WorkerConfig:
+    asyncIO: bool = True
+    datasetWriterWorkers: int = 1
+    checkpointWriterWorkers: int = 1
+    ioQueueSize: int = 2
+
+
 def _normalize_config_payload(payload: Any) -> Any:
     if isinstance(payload, dict):
-        normalized = {
-            key: _normalize_config_payload(value)
-            for key, value in payload.items()
-        }
+        normalized = {key: _normalize_config_payload(value) for key, value in payload.items()}
         evolutionConfig = normalized.get("evolution")
         if isinstance(evolutionConfig, dict):
             evolutionConfig.pop("generator", None)
@@ -208,7 +348,6 @@ class EvolutionConfig:
     wideGridRampSteps: int | None = None
     linearResponseChunkSize: int | None = None
     wideResponseChunkSize: int | None = None
-    responseReductionTileCap: int = 256
 
     @property
     def cloneCount(self) -> int:
@@ -274,7 +413,6 @@ class EvolutionConfig:
             "wideGridRampSteps": self.wideGridRampSteps,
             "linearResponseChunkSize": self.linearResponseChunkSize,
             "wideResponseChunkSize": self.wideResponseChunkSize,
-            "responseReductionTileCap": self.responseReductionTileCap,
         }
 
 
@@ -287,7 +425,6 @@ def _select_evaluation(evaluation: BatchEvaluation, ids: torch.Tensor) -> BatchE
         linearResponse=evaluation.linearResponse[ids],
         targetAZEL=(evaluation.targetAZEL[0][ids], evaluation.targetAZEL[1][ids]),
         targetMode=evaluation.targetMode,
-        diagnostics=EvaluationDiagnostics.zeroedFrom(evaluation.diagnostics),
     )
 
 
@@ -299,16 +436,15 @@ def _merge_evaluations(evaluations: list[BatchEvaluation]) -> BatchEvaluation:
         totalLoss=torch.cat([evaluation.totalLoss for evaluation in evaluations], dim=0),
         shapeLoss=torch.cat([evaluation.shapeLoss for evaluation in evaluations], dim=0),
         efficiencyLoss=torch.cat([evaluation.efficiencyLoss for evaluation in evaluations], dim=0),
-        wideSupportLoss=torch.cat([evaluation.wideSupportLoss for evaluation in evaluations], dim=0),
+        wideSupportLoss=torch.cat(
+            [evaluation.wideSupportLoss for evaluation in evaluations], dim=0
+        ),
         linearResponse=torch.cat([evaluation.linearResponse for evaluation in evaluations], dim=0),
         targetAZEL=(
             torch.cat([evaluation.targetAZEL[0] for evaluation in evaluations], dim=0),
             torch.cat([evaluation.targetAZEL[1] for evaluation in evaluations], dim=0),
         ),
         targetMode=reference.targetMode,
-        diagnostics=EvaluationDiagnostics.merge(
-            [evaluation.diagnostics for evaluation in evaluations]
-        ),
     )
 
 
@@ -332,6 +468,10 @@ class EvolutionController:
     datasetBuffer: list[dict[str, Any]] = field(default_factory=list)
     datasetShardIndex: int = 0
     writerLogDir: str | Path | None = "runs"
+
+    def __post_init__(self) -> None:
+        if isinstance(self.targetSpec, TargetSpec) and self.targetMode == "auto":
+            self.targetMode = "shared"
 
     @property
     def archiveLocation(self) -> Path:
@@ -373,6 +513,76 @@ class EvolutionController:
 
     def listStepPaths(self) -> list[Path]:
         return sorted(self.archiveLocation.glob("step_*.pt"))
+
+    def _usesSharedTargetTemplate(self) -> bool:
+        return isinstance(self.targetSpec, TargetSpec) and self.targetMode == "shared"
+
+    def _batchFromTemplate(
+        self,
+        templateBatch: ArrayBatch,
+        batchSize: int,
+        weightsType: str,
+    ) -> ArrayBatch:
+        if batchSize <= 0:
+            raise ValueError("batchSize must be positive")
+
+        device = templateBatch.device
+        dtype = templateBatch.dtype
+        elementLocalPosition = templateBatch.elementLocalPosition.expand(batchSize, -1, -1).clone()
+        LLAPosition = templateBatch.LLAPosition.expand(batchSize, -1).clone()
+        ECEFPosition = templateBatch.ECEFPosition.expand(batchSize, -1).clone()
+        gain = templateBatch.gain.expand(batchSize).clone()
+        elementMask = (
+            None
+            if templateBatch.elementMask is None
+            else templateBatch.elementMask.expand(batchSize, -1).clone()
+        )
+
+        if weightsType == "random":
+            weights = sampleRandomWeights(
+                self.arraySpec,
+                batchSize,
+                templateBatch.N,
+                device,
+                dtype,
+                elementMask,
+                generator=self.config.generator,
+            )
+        elif weightsType == "uniform":
+            weights = sampleUniformWeights(
+                self.arraySpec,
+                batchSize,
+                templateBatch.N,
+                device,
+                dtype,
+                elementMask,
+                generator=self.config.generator,
+            )
+        elif weightsType == "directed":
+            targetLLA = inferTargetCenter(self.targetSpec).to(device=device, dtype=dtype)
+            weights = sampleDirectedWeights(
+                self.arraySpec,
+                batchSize,
+                elementLocalPosition,
+                device,
+                dtype,
+                targetLLA=targetLLA,
+                arrayLLA=LLAPosition,
+                elementMask=elementMask,
+                generator=self.config.generator,
+            )
+        else:
+            raise ValueError(f"Unknown weightsType: {weightsType}")
+
+        return ArrayBatch(
+            elementLocalPosition=elementLocalPosition,
+            weights=weights,
+            wavelength=templateBatch.wavelength,
+            gain=gain,
+            LLAPosition=LLAPosition,
+            ECEFPosition=ECEFPosition,
+            elementMask=elementMask,
+        )
 
     def _startWriters(self) -> None:
         asyncEnabled = self.workerConfig.asyncIO
@@ -459,18 +669,6 @@ class EvolutionController:
             "parentPhaseStd": parentPhaseStd,
             "parentAmplitudeStd": parentAmplitudeStd,
         }
-        diagnostics = evaluation.diagnostics
-        summary.update(
-            {
-                "evalTargetProjectionMS": diagnostics.targetProjectionMS,
-                "evalLinearResponseMS": diagnostics.linearResponseMS,
-                "evalWideResponseMS": diagnostics.wideResponseMS,
-                "evalTotalMS": diagnostics.totalMS,
-                "usedSharedTargetFastPath": float(diagnostics.usedSharedTargetFastPath),
-            }
-        )
-        if diagnostics.gpuMaxMemoryMB is not None:
-            summary["gpuMaxMemoryMB"] = diagnostics.gpuMaxMemoryMB
         return summary
 
     def _logMetrics(self, step: int, summary: dict[str, Any]) -> None:
@@ -490,15 +688,6 @@ class EvolutionController:
         self.writer.add_scalar("Param/WideGridSize", summary["wideGridSize"], step)
         self.writer.add_scalar("Parent/PhaseStd", summary["parentPhaseStd"], step)
         self.writer.add_scalar("Parent/AmplitudeStd", summary["parentAmplitudeStd"], step)
-
-        if step % 10 == 0:
-            self.writer.add_scalar("Eval/TargetProjectionMS", summary["evalTargetProjectionMS"], step)
-            self.writer.add_scalar("Eval/LinearResponseMS", summary["evalLinearResponseMS"], step)
-            self.writer.add_scalar("Eval/WideResponseMS", summary["evalWideResponseMS"], step)
-            self.writer.add_scalar("Eval/TotalMS", summary["evalTotalMS"], step)
-            self.writer.add_scalar("Eval/UsedSharedTargetFastPath", summary["usedSharedTargetFastPath"], step)
-            if "gpuMaxMemoryMB" in summary:
-                self.writer.add_scalar("GPU/MaxMemoryMB", summary["gpuMaxMemoryMB"], step)
 
     def _compactResponse(self, response: torch.Tensor) -> torch.Tensor:
         size = self.loggingConfig.responseCompactSize
@@ -525,7 +714,9 @@ class EvolutionController:
             payload["map"] = self._compactResponse(response)
         return payload
 
-    def _bufferDatasetRecords(self, step: int, batch: ArrayBatch, evaluation: BatchEvaluation) -> None:
+    def _bufferDatasetRecords(
+        self, step: int, batch: ArrayBatch, evaluation: BatchEvaluation
+    ) -> None:
         if self.loggingConfig.logMode not in {"dataset_compact", "dataset_full"}:
             return
 
@@ -548,13 +739,14 @@ class EvolutionController:
             }
 
             if sharedTarget is None:
-                record["target"] = fetchTargetSample(self.targetSpec, sampleIdx).serializeTargetSpec()
+                record["target"] = fetchTargetSample(
+                    self.targetSpec, sampleIdx
+                ).serializeTargetSpec()
             self.datasetBuffer.append(record)
 
-        shouldFlush = (
-            (step + 1) % self.loggingConfig.datasetFlushEverySteps == 0
-            and len(self.datasetBuffer) > 0
-        )
+        shouldFlush = (step + 1) % self.loggingConfig.datasetFlushEverySteps == 0 and len(
+            self.datasetBuffer
+        ) > 0
         if shouldFlush:
             payload = {
                 "experimentName": self.experimentName,
@@ -571,7 +763,9 @@ class EvolutionController:
         if not self.datasetBuffer:
             return
 
-        sharedTarget = serializeTarget(self.targetSpec) if isinstance(self.targetSpec, TargetSpec) else None
+        sharedTarget = (
+            serializeTarget(self.targetSpec) if isinstance(self.targetSpec, TargetSpec) else None
+        )
         payload = {
             "experimentName": self.experimentName,
             "sharedTarget": sharedTarget,
@@ -710,12 +904,13 @@ class EvolutionController:
             targetMode=self.targetMode,
             linearResponseChunkSize=self.config.linearResponseChunkSize,
             wideResponseChunkSize=self.config.wideResponseChunkSize,
-            responseReductionTileCap=self.config.responseReductionTileCap,
         )
 
     def _populationForStep(self, batch: ArrayBatch, step: int) -> PopulationState:
         lossParams = self._lossParamsForStep(step)
-        return PopulationState(batch=batch, evaluation=self.evaluate(batch, lossParams), lossParams=lossParams)
+        return PopulationState(
+            batch=batch, evaluation=self.evaluate(batch, lossParams), lossParams=lossParams
+        )
 
     def _initialSchedulerState(self) -> SchedulerState:
         phaseSigma, amplitudeSigma = self.config.baseSigmaAt(0)
@@ -777,14 +972,30 @@ class EvolutionController:
         targetLLA = None
         if self.config.initialWeightsType == "directed":
             targetLLA = inferTargetCenter(self.targetSpec).to(device=device, dtype=dtype)
-        return generateBatch(
+        if not self._usesSharedTargetTemplate():
+            return generateBatch(
+                self.arraySpec,
+                batchSize=self.config.batchSize,
+                device=device,
+                dtype=dtype,
+                weightsType=self.config.initialWeightsType,
+                targetLLA=targetLLA,
+                generator=self.config.generator,
+            )
+
+        templateBatch = generateBatch(
             self.arraySpec,
-            batchSize=self.config.batchSize,
+            batchSize=1,
             device=device,
             dtype=dtype,
             weightsType=self.config.initialWeightsType,
             targetLLA=targetLLA,
             generator=self.config.generator,
+        )
+        return self._batchFromTemplate(
+            templateBatch=templateBatch,
+            batchSize=self.config.batchSize,
+            weightsType=self.config.initialWeightsType,
         )
 
     def _parentDiversity(self, parentBatch: ArrayBatch) -> tuple[float, float]:
@@ -924,14 +1135,21 @@ class EvolutionController:
             offspringBatches.append(mutationChildren)
 
         if counts.randomCount > 0:
-            randomChildren = generateBatch(
-                self.arraySpec,
-                counts.randomCount,
-                device,
-                dtype,
-                weightsType="random",
-                generator=self.config.generator,
-            )
+            if self._usesSharedTargetTemplate():
+                randomChildren = self._batchFromTemplate(
+                    templateBatch=batch.fetch(0),
+                    batchSize=counts.randomCount,
+                    weightsType="random",
+                )
+            else:
+                randomChildren = generateBatch(
+                    self.arraySpec,
+                    counts.randomCount,
+                    device,
+                    dtype,
+                    weightsType="random",
+                    generator=self.config.generator,
+                )
             nextBatches.append(randomChildren)
             offspringBatches.append(randomChildren)
 
@@ -1070,7 +1288,9 @@ class EvolutionController:
                     )
 
                 improvementEpsilon = self._improvementEpsilon(bestScoreOverall)
-                improved = bestScoreOverall is None or bestScore < bestScoreOverall - improvementEpsilon
+                improved = (
+                    bestScoreOverall is None or bestScore < bestScoreOverall - improvementEpsilon
+                )
                 if improved:
                     bestScoreOverall = bestScore
                     bestStepOverall = step
@@ -1148,3 +1368,48 @@ class EvolutionController:
                 self.writer.close()
                 self.writer = None
             self._closeWriters()
+
+
+def buildControllerFromConfig(
+    configPath: str,
+) -> tuple[EvolutionController, tuple[torch.device, torch.dtype, ExperimentConfig]]:
+    from train.config import loadRunConfig, resolveDevice, resolveTarget, runConfigToDict
+
+    runConfig = loadRunConfig(configPath)
+    target = resolveTarget(runConfig)
+    device, dtype = resolveDevice(runConfig)
+    controller = EvolutionController(
+        config=runConfig.evolution,
+        targetSpec=target,
+        arraySpec=runConfig.array,
+        lossParams=runConfig.loss,
+        experimentName=runConfig.experiment.name,
+        archiveRoot=runConfig.experiment.archiveDir,
+        loggingConfig=runConfig.logging,
+        checkpointConfig=runConfig.checkpoint,
+        workerConfig=runConfig.workers,
+        targetMode=runConfig.experiment.targetMode,
+        sourceConfigPath=runConfig.sourcePath,
+        resolvedConfig=runConfigToDict(runConfig),
+        writerLogDir=runConfig.experiment.logDir,
+    )
+    return controller, (device, dtype, runConfig.experiment)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run Helios evolution from YAML config")
+    parser.add_argument("--config", required=True, help="Path to YAML config")
+    args = parser.parse_args()
+
+    controller, (device, dtype, experiment) = buildControllerFromConfig(args.config)
+    controller.train(
+        dtype=dtype,
+        device=device,
+        logDir=experiment.logDir,
+        plotProjection=experiment.plotProjection,
+        resume=experiment.resume,
+    )
+
+
+if __name__ == "__main__":
+    main()

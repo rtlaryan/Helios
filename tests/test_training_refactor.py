@@ -5,7 +5,6 @@ from pathlib import Path
 import pytest
 import torch
 import yaml
-
 from scripts.arrayBatch import ArrayBatch
 from scripts.arraySpec import ArraySpec
 from scripts.batchFactory import (
@@ -18,8 +17,15 @@ from scripts.batchFactory import (
 from scripts.coordinateTransforms import LLAtoECEF
 from scripts.targetSpec import TargetBatch, TargetSpec, inferTargetCenter
 from train.config import loadRunConfig, resolveTarget, runConfigToDict
-from train.evolve import EvolutionConfig, EvolutionController
+from train.evolve import (
+    CheckpointConfig,
+    EvolutionConfig,
+    EvolutionController,
+    LoggingConfig,
+    WorkerConfig,
+)
 from train.objective import (
+    BatchEvaluation,
     LossConfig,
     _getWideGrid,
     _powerEfficiencyLoss,
@@ -31,7 +37,6 @@ from train.objective import (
     _wideSupportLossFromResponse,
     evaluateBatch,
 )
-from train.runtime import CheckpointConfig, LoggingConfig, WorkerConfig
 
 
 def make_target() -> TargetSpec:
@@ -65,6 +70,10 @@ def make_array_spec() -> ArraySpec:
         longitudeRange=(-83.0, -83.0),
         altitudeRange=(3.6e7, 3.6e7),
     )
+
+
+def rows_are_identical(tensor: torch.Tensor) -> bool:
+    return bool(torch.equal(tensor, tensor[:1].expand_as(tensor)))
 
 
 def test_load_run_config_with_inline_target_accepts_deprecated_loss_keys(tmp_path: Path) -> None:
@@ -141,7 +150,6 @@ def test_load_run_config_accepts_crossover_and_scheduler_fields(tmp_path: Path) 
             "wideGridRampSteps": 10,
             "linearResponseChunkSize": 256,
             "wideResponseChunkSize": 128,
-            "responseReductionTileCap": 2048,
         },
         "logging": {"logMode": "metrics_only"},
         "checkpoint": {"checkpointMode": "off"},
@@ -163,9 +171,7 @@ def test_load_run_config_accepts_crossover_and_scheduler_fields(tmp_path: Path) 
     assert runConfig.evolution.wideGridSizeStart == 8
     assert runConfig.evolution.linearResponseChunkSize == 256
     assert runConfig.evolution.wideResponseChunkSize == 128
-    assert runConfig.evolution.responseReductionTileCap == 2048
     assert serialized["evolution"]["wideGridRampSteps"] == 10
-    assert serialized["evolution"]["responseReductionTileCap"] == 2048
     assert "responseChunkShapeStrategy" not in serialized["evolution"]
 
 
@@ -230,7 +236,9 @@ def test_infer_target_center_supports_target_batch() -> None:
     )
 
 
-def test_init_evolution_directed_uses_inferred_target_center(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_init_evolution_directed_uses_inferred_target_center(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     target = TargetSpec(
         searchLatitudes=torch.tensor([[0.0, 0.0], [10.0, 10.0]], dtype=torch.float32),
         searchLongitudes=torch.tensor([[0.0, 10.0], [0.0, 10.0]], dtype=torch.float32),
@@ -263,6 +271,37 @@ def test_init_evolution_directed_uses_inferred_target_center(monkeypatch: pytest
         captured["targetLLA"],
         torch.tensor([10.0, 7.5], dtype=torch.float32),
     )
+
+
+def test_init_evolution_shared_target_keeps_a_homogeneous_template() -> None:
+    controller = EvolutionController(
+        config=EvolutionConfig(
+            batchSize=3,
+            evolutionSteps=1,
+            initialWeightsType="random",
+            generator=torch.Generator().manual_seed(0),
+        ),
+        targetSpec=make_target(),
+        arraySpec=ArraySpec(
+            allowedElementCount=(4, 9),
+            allowedAspectRatio=(1.0, 0.5),
+            positionJitterSTD=0.1,
+            gainRange=(1.0, 2.0),
+            latitudeRange=(0.0, 1.0),
+            longitudeRange=(-83.0, -82.0),
+            altitudeRange=(3.6e7, 3.7e7),
+        ),
+        lossParams=LossConfig(wide_grid_size=8),
+    )
+
+    batch = controller.initEvolution(dtype=torch.float32, device=torch.device("cpu"))
+
+    assert controller.targetMode == "shared"
+    assert rows_are_identical(batch.elementLocalPosition)
+    assert rows_are_identical(batch.LLAPosition)
+    assert rows_are_identical(batch.ECEFPosition)
+    assert rows_are_identical(batch.gain)
+    assert not rows_are_identical(batch.weights)
 
 
 def test_rank_weighted_parent_sampling_prefers_better_ranks() -> None:
@@ -473,8 +512,6 @@ def test_shared_target_fast_path_matches_standard_path() -> None:
         allowSharedTargetFastPath=True,
     )
 
-    assert fastEval.diagnostics.usedSharedTargetFastPath
-    assert not standardEval.diagnostics.usedSharedTargetFastPath
     torch.testing.assert_close(fastEval.totalLoss, standardEval.totalLoss)
     torch.testing.assert_close(fastEval.shapeLoss, standardEval.shapeLoss)
     torch.testing.assert_close(fastEval.efficiencyLoss, standardEval.efficiencyLoss)
@@ -504,14 +541,23 @@ def test_shared_target_fast_path_skips_heterogeneous_batches() -> None:
         elementMask=None if batch.elementMask is None else batch.elementMask.clone(),
     )
 
-    evaluation = evaluateBatch(
+    standardEvaluation = evaluateBatch(
         heterogeneousBatch,
         target,
         LossConfig(wide_grid_size=8),
         targetMode="shared",
+        allowSharedTargetFastPath=False,
+    )
+    fastEvaluation = evaluateBatch(
+        heterogeneousBatch,
+        target,
+        LossConfig(wide_grid_size=8),
+        targetMode="shared",
+        allowSharedTargetFastPath=True,
     )
 
-    assert not evaluation.diagnostics.usedSharedTargetFastPath
+    torch.testing.assert_close(fastEvaluation.totalLoss, standardEvaluation.totalLoss)
+    torch.testing.assert_close(fastEvaluation.linearResponse, standardEvaluation.linearResponse)
 
 
 def test_explicit_chunk_sizes_preserve_evaluation_results() -> None:
@@ -545,8 +591,6 @@ def test_explicit_chunk_sizes_preserve_evaluation_results() -> None:
         allowSharedTargetFastPath=False,
     )
 
-    assert chunked.diagnostics.linearResponseChunkSize == 4
-    assert chunked.diagnostics.wideResponseChunkSize == 4
     torch.testing.assert_close(chunked.totalLoss, baseline.totalLoss)
     torch.testing.assert_close(chunked.linearResponse, baseline.linearResponse)
     torch.testing.assert_close(chunked.wideSupportLoss, baseline.wideSupportLoss)
@@ -573,8 +617,7 @@ def test_float_like_chunk_sizes_from_config_remain_usable() -> None:
         allowSharedTargetFastPath=False,
     )
 
-    assert evaluation.diagnostics.linearResponseChunkSize == batch.batchSize * batch.N * 4
-    assert evaluation.diagnostics.wideResponseChunkSize == 120
+    assert evaluation.totalLoss.shape == (batch.batchSize,)
 
 
 def test_shape_loss_uses_global_peak_referenced_response() -> None:
@@ -641,7 +684,9 @@ def test_projected_support_rasterization_marks_only_positive_importance() -> Non
         ),
     )
 
-    supportMask = _rasterizeWideSupportMask(targetAZEL, prep, wideAZGrid, wideELGrid, dilationCells=0)
+    supportMask = _rasterizeWideSupportMask(
+        targetAZEL, prep, wideAZGrid, wideELGrid, dilationCells=0
+    )
 
     assert bool(supportMask[0, 1, 1])
     assert bool(supportMask[0, 3, 4])
@@ -669,8 +714,12 @@ def test_projected_support_dilation_fills_expected_neighbors() -> None:
         ),
     )
 
-    supportMask = _rasterizeWideSupportMask(targetAZEL, prep, wideAZGrid, wideELGrid, dilationCells=0)
-    dilatedMask = _rasterizeWideSupportMask(targetAZEL, prep, wideAZGrid, wideELGrid, dilationCells=1)
+    supportMask = _rasterizeWideSupportMask(
+        targetAZEL, prep, wideAZGrid, wideELGrid, dilationCells=0
+    )
+    dilatedMask = _rasterizeWideSupportMask(
+        targetAZEL, prep, wideAZGrid, wideELGrid, dilationCells=1
+    )
 
     assert int(supportMask.sum().item()) == 1
     assert int(dilatedMask.sum().item()) == 9
@@ -827,6 +876,54 @@ def test_init_evolution_uses_configured_initial_weights_type() -> None:
         torch.zeros_like(batch.weights.angle()),
         atol=1e-6,
         rtol=0.0,
+    )
+
+
+def test_shared_target_random_injection_reuses_population_template() -> None:
+    controller = EvolutionController(
+        config=EvolutionConfig(
+            batchSize=3,
+            evolutionSteps=2,
+            cloneFraction=0.0,
+            crossoverFraction=0.0,
+            mutateFraction=0.0,
+            randomFraction=1.0,
+            parentPoolFraction=1.0,
+            generator=torch.Generator().manual_seed(0),
+        ),
+        targetSpec=make_target(),
+        arraySpec=ArraySpec(
+            allowedElementCount=(4, 9),
+            allowedAspectRatio=(1.0, 0.5),
+            positionJitterSTD=0.1,
+            gainRange=(1.0, 2.0),
+            latitudeRange=(0.0, 1.0),
+            longitudeRange=(-83.0, -82.0),
+            altitudeRange=(3.6e7, 3.7e7),
+        ),
+        lossParams=LossConfig(wide_grid_size=8),
+    )
+    batch = controller.initEvolution(dtype=torch.float32, device=torch.device("cpu"))
+    population = controller._populationForStep(batch, 0)
+
+    nextPopulation = controller.evolutionStep(0, population, controller._initialSchedulerState())
+
+    template = batch.fetch(0)
+    torch.testing.assert_close(
+        nextPopulation.batch.elementLocalPosition,
+        template.elementLocalPosition.expand_as(nextPopulation.batch.elementLocalPosition),
+    )
+    torch.testing.assert_close(
+        nextPopulation.batch.LLAPosition,
+        template.LLAPosition.expand_as(nextPopulation.batch.LLAPosition),
+    )
+    torch.testing.assert_close(
+        nextPopulation.batch.ECEFPosition,
+        template.ECEFPosition.expand_as(nextPopulation.batch.ECEFPosition),
+    )
+    torch.testing.assert_close(
+        nextPopulation.batch.gain,
+        template.gain.expand_as(nextPopulation.batch.gain),
     )
 
 
