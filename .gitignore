@@ -11,3 +11,4 @@ runs/
 heliosDebug.ipynb
 .*
 .ruff*
+tests/

@@ -1,26 +1,33 @@
+# Standalone reference config for evolution training with the legacy objective v1.
+# This file documents the v1-only loss block and wide-grid fidelity ramp fields.
+# See `configs/evolution/evo_v2_reference.yaml` for the standalone regional objective.
+
 # Experiment-level runtime settings.
 experiment:
-  name: evo_3_multibeam_new # Experiment name used for run/archive output folders.
+  name: evo_v1_reference # Experiment name used for run/archive output folders.
   logDir: data/runs/evolution # TensorBoard and run metadata root directory.
   archiveDir: data/archive/evolution # Checkpoint / dataset / summary output root directory.
   resume: false # Whether to resume from an existing checkpoint if present.
   plotProjection: false # Whether to render projection plots during training.
   tensorboard: true # Whether TensorBoard logging is enabled.
-  targetMode: shared # How targets are interpreted: shared target or per-sample target batch.
+  targetMode: shared # How targets are interpreted: auto, shared, or per-sample target batch.
+
+# Objective selector.
+objectiveVersion: v1 # Use the original objective implementation in train/objective.py.
 
 # Device and numeric precision.
 device:
-  device: cuda # Torch device to run training on.
+  device: cuda # Torch device to run training on, e.g. cpu or cuda.
   dtype: float32 # Floating-point dtype used for simulation and optimization.
 
 # Array search-space definition.
 array:
   centerFrequency: 30.0e9 # Carrier frequency in Hz.
-  elementSpacingRatio: 0.5 # Element spacing in wavelengths.
-  positionJitterSTD: 0.0 # Standard deviation of element position jitter in meters.
-  phaseJitterSTD: 0.0 # Standard deviation of initialization phase jitter in radians.
+  elementSpacingRatio: 0.5 # Element spacing expressed in wavelengths.
+  positionJitterSTD: 0.0 # Standard deviation of per-element position jitter in meters.
+  phaseJitterSTD: 0.0 # Standard deviation of phase jitter in radians during initialization/mutation.
   failRate: 0.0 # Probability that an element is disabled in the sampled array mask.
-  allowedElementCount: [10000] # Allowed element counts to sample from.
+  allowedElementCount: [10000] # Allowed element counts to sample from when generating candidate arrays.
   allowedAspectRatio: [1.0] # Allowed array aspect ratios to sample from.
   geometry: URA # Array geometry family, e.g. URA or UCA.
   gainRange: [1.0, 1.0] # Min/max platform gain sampled per array.
@@ -31,7 +38,7 @@ array:
 
 # Evolutionary optimizer settings.
 evolution:
-  generator: null # Optional explicit torch.Generator seed/state source.
+  generator: null # Optional explicit torch.Generator seed/state source. Usually left null.
   batchSize: 40 # Population size evaluated each evolution step.
   evolutionSteps: 20000 # Number of evolution iterations to run.
   initialWeightsType: random # Initial weight sampler: random, uniform, or directed.
@@ -42,32 +49,33 @@ evolution:
   parentPoolFraction: 0.15 # Fraction of best-ranked population eligible for reproduction.
   phaseSigma: 0.2 # Initial mutation noise scale for phase perturbations.
   amplitudeSigma: 0.01 # Initial mutation noise scale for amplitude perturbations.
-  gainSigma: 0 # Reserved gain mutation scale.
+  gainSigma: 0.0 # Reserved gain mutation scale. Currently kept for compatibility.
   phaseSigmaDecay: 0.9998 # Per-step decay applied to phase mutation sigma.
   amplitudeSigmaDecay: 0.9995 # Per-step decay applied to amplitude mutation sigma.
   randomFractionDecay: 0.999 # Per-step decay applied to random injection fraction.
   phaseMinSigma: 5e-4 # Hard lower bound for phase mutation sigma.
   amplitudeMinSigma: 5e-5 # Hard lower bound for amplitude mutation sigma.
   minRandomFraction: 0.02 # Minimum random injection fraction after decay.
+  lossType: HUBER # Legacy loss-type field retained for v1 compatibility.
   stagnationWindow: 250 # Number of non-improving steps before exploration boost triggers.
   sigmaBoostDuration: 25 # Number of steps exploration boost stays active.
   sigmaBoostMultiplier: 2.0 # Multiplier applied to sigmas during exploration boost.
   sigmaBoostRandomFraction: 0.15 # Minimum random fraction enforced during boost windows.
-  phaseAdaptiveSigmaFloor: false # Whether phase sigma floor adapts to parent diversity.
+  phaseAdaptiveSigmaFloor: false # Whether the phase sigma floor adapts to parent diversity.
+  amplitudeAdaptiveSigmaFloor: true # Whether the amplitude sigma floor adapts to parent diversity.
   phaseMinSigmaScale: 0.1 # Scale factor for adaptive phase sigma floor.
   amplitudeMinSigmaScale: 0.1 # Scale factor for adaptive amplitude sigma floor.
-  wideGridSizeStart: 128 # Initial wide-angle grid size before fidelity ramping.
-  wideGridRampSteps: 4000 # Number of steps used to ramp wide grid size to final value.
+  wideGridSizeStart: 128 # Initial wide-angle grid size before ramping to the final v1 wide grid size.
+  wideGridRampSteps: 4000 # Number of steps used to ramp the v1 wide grid size to its final value.
   linearResponseChunkSize: 1000000000 # Chunk cap for target-grid response evaluation.
   wideResponseChunkSize: 1000000000 # Chunk cap for wide-grid response evaluation.
-  lossType: HUBER # Backward-compatible loss type field; objective uses structured loss terms.
 
-# Objective weighting / fidelity settings.
+# Objective v1 weighting / fidelity settings.
 loss:
   w_shape: 1.0 # Weight on in-target shape fidelity loss.
   w_eff: 0.1 # Weight on power-efficiency loss.
-  w_wide: 15 # Weight on outside-support suppression loss.
-  wide_grid_size: 128 # Final wide-angle evaluation grid size.
+  w_wide: 15.0 # Weight on outside-support suppression loss.
+  wide_grid_size: 128 # Final wide-angle evaluation grid size for v1.
   wide_support_dilation_cells: 1 # Support-mask dilation radius in wide-grid cells.
 
 # Metrics / dataset logging settings.
@@ -88,12 +96,21 @@ workers:
   checkpointWriterWorkers: 2 # Number of async workers used for checkpoints / summaries.
   ioQueueSize: 4 # Max queue depth for async IO tasks.
 
-# Target source configuration. Exactly one source mode should be active.
+# Target source configuration. Exactly one of reference, references, manifest, inline, or inlineBatch should be active.
 target:
-  reference: data/targets/manual/target_spec.pt # Shared target file path.
-  references: null # Optional list of per-sample target paths.
-  inline: null # Optional inline shared target payload.
-  inlineBatch: null # Optional inline per-sample target batch payload.
+  reference: data/targets/manual/target_spec.pt # Shared target file path used when targetMode is shared.
+  references: null # Optional explicit list of per-sample target paths.
+  manifest: null # Optional manifest YAML containing target record paths.
+  inline: null # Optional inline shared target payload serialized directly in YAML.
+  inlineBatch: null # Optional inline list of per-sample target payloads.
   format: null # Optional explicit target format override, e.g. pt or zones_json.
+  selection: first # Target selection policy for manifest/references: first, random, or first_n.
+  selectionCount: null # Optional number of targets to select when using multi-target sources.
+  selectionSeed: null # Optional RNG seed used for target selection when randomness is involved.
   resolutionDeg: 0.01 # Resolution used when loading JSON zone targets.
   decimate: 6 # Spatial decimation factor applied after target load.
+  loadingMode: block_window # Corpus loading strategy. Shared-target runs typically ignore this.
+  blockSize: 4096 # Number of manifest targets per loader block when block loading is used.
+  prefetchNextBlock: true # Whether the next target block is prefetched in the background.
+  loaderWorkers: auto # Number of loader workers, or auto to derive a count from CPU availability.
+  shuffleEachEpoch: true # Whether manifest-backed target order is reshuffled each epoch.

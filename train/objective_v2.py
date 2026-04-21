@@ -28,7 +28,7 @@ class LossConfigV2:
     peak_topk: int = 8
     samples_per_hpbw: float = 4.0
     min_front_grid_size: int = 32
-    max_front_grid_size: int = 256
+    max_front_grid_size: int = 128
 
 
 @dataclass
@@ -64,9 +64,7 @@ class _FineSharedCache:
     azimuth: torch.Tensor
     elevation: torch.Tensor
     steering: torch.Tensor
-    qService: torch.Tensor
     qShell: torch.Tensor
-    serviceWeightSum: torch.Tensor
     shellWeightSum: torch.Tensor
 
 
@@ -455,9 +453,7 @@ def _buildFineSharedCache(
         azimuth=azimuth,
         elevation=elevation,
         steering=steering,
-        qService=_buildOperator(steering, serviceWeights),
         qShell=_buildOperator(steering, shellWeights),
-        serviceWeightSum=serviceWeights.sum().clamp_min(torch.finfo(batch.dtype).eps),
         shellWeightSum=shellWeights.sum().clamp_min(torch.finfo(batch.dtype).eps),
     )
     _FINE_SHARED_CACHE_V2[cacheKey] = cached

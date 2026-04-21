@@ -4,6 +4,7 @@ import argparse
 import json
 import statistics
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -24,20 +25,40 @@ def _clearV1Caches() -> None:
     objective_v1._WIDE_GRID_CACHE.clear()
 
 
+def _with_seeded_rng(seed: int, device: torch.device, fn: Callable[[], Any]) -> Any:
+    cpuState = torch.random.get_rng_state()
+    cudaStates = None
+    if torch.cuda.is_available():
+        cudaStates = torch.cuda.get_rng_state_all()
+
+    torch.manual_seed(seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(seed)
+
+    try:
+        return fn()
+    finally:
+        torch.random.set_rng_state(cpuState)
+        if cudaStates is not None:
+            torch.cuda.set_rng_state_all(cudaStates)
+
+
 def _build_fixture_batch(target: TargetLike, config: Any, device: torch.device, dtype: torch.dtype) -> Any:
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(1234)
     targetLLA = None
     if config.evolution.initialWeightsType == "directed":
         targetLLA = inferTargetCenter(target)
-    return generateBatch(
-        spec=config.array,
-        batchSize=config.evolution.batchSize,
-        device=device,
-        dtype=dtype,
-        weightsType=config.evolution.initialWeightsType,
-        targetLLA=targetLLA,
-        generator=generator,
+    return _with_seeded_rng(
+        1234,
+        device,
+        lambda: generateBatch(
+            spec=config.array,
+            batchSize=config.evolution.batchSize,
+            device=device,
+            dtype=dtype,
+            weightsType=config.evolution.initialWeightsType,
+            targetLLA=targetLLA,
+            generator=None,
+        ),
     )
 
 
