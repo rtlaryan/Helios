@@ -1,0 +1,39 @@
+# Example CNN encoder + coordinate-conditioned decoder model.
+architecture: cnn_mlp # Uses the CNN encoder builder with a different decoder type.
+
+common:
+  activation: relu # Nonlinearity used in configurable encoder / decoder blocks.
+  norm: none # Normalization style applied in configurable decoder MLP blocks.
+  hiddenDim: 128 # Fallback hidden width for decoders that omit explicit MLP layer sizes.
+  logStdMode: global # Policy log-std parameterization: one shared value or per-dimension values.
+  logStdInit: -0.5 # Initial log standard deviation for the Gaussian policy.
+
+encoder:
+  type: cnn # Encoder family used by the selected architecture.
+  cnn:
+    inChannels: 2 # Number of input channels; PPO currently uses normalized power + importance.
+    convChannels: [16, 32, 64] # Output channels for each convolution stage.
+    kernelSizes: [5, 3, 3] # Kernel size for each convolution stage.
+    strides: [2, 2, 2] # Stride for each convolution stage.
+    paddings: [3, 2, 1] # Padding for each convolution stage.
+    pooling: adaptive_avg # Final spatial pooling mode used to produce one latent vector per target.
+    dropout: 0.0 # Dropout probability applied inside the CNN encoder stack.
+  transformer:
+    patchSize: 4 # Spatial patch size for patch embedding.
+    embedDim: 256 # Transformer token embedding width.
+    depth: 6 # Number of transformer blocks.
+    numHeads: 8 # Number of self-attention heads per block.
+    mlpRatio: 4.0 # Expansion ratio of the transformer feedforward block.
+
+decoder:
+  type: coordinate_conditioned # Shared per-element decoder conditioned on geometry/context features.
+  flat_action:
+    mlpLayers: [512, 512, 256] # Unused for this decoder type; kept for easy switching.
+    dropout: 0.0 # Unused for this decoder type; kept for easy switching.
+  coordinate_conditioned:
+    mlpLayers: [128, 128, 128] # Hidden widths for the shared per-element decoder MLP.
+    dropout: 0.0 # Dropout probability applied inside the per-element decoder trunk.
+
+context:
+  globalFeatures: [] # Global per-array context features appended to the decoder input.
+  elementFeatures: [normalized_aperture_xyz, element_local_xyz, element_mask] # Per-element context features broadcast into the decoder.

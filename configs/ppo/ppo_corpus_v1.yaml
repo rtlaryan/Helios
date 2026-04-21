@@ -1,0 +1,71 @@
+# Experiment-level runtime settings.
+experiment:
+  name: ppo_corpus_flat_10k # Experiment name used for run/archive output folders.
+  logDir: data/runs/ppo # TensorBoard and run metadata root directory.
+  archiveDir: data/archive/ppo # Checkpoint / summary output root directory.
+  resume: false # Whether to resume from an existing PPO checkpoint if present.
+
+# Device and numeric precision.
+device:
+  device: cuda # Torch device to run PPO on.
+  dtype: float32 # Floating-point dtype used for model / simulator tensors.
+
+# Fixed array template for PPO v1.
+array:
+  allowedElementCount: [10000] # PPO v1 requires exactly one fixed element count.
+  allowedAspectRatio: [1.0] # PPO v1 requires exactly one fixed aspect ratio.
+  latitudeRange: [15.0, 15.0] # Fixed array platform latitude range in degrees.
+  longitudeRange: [-83.0, -83.0] # Fixed array platform longitude range in degrees.
+  altitudeRange: [5.5e6, 5.5e6] # Fixed array platform altitude range in meters.
+
+# Path to the external model-architecture YAML.
+modelConfig: ../models/cnn_mlp_v1.yaml # Relative path is resolved from this PPO config file.
+
+# PPO optimizer / rollout settings.
+ppo:
+  rolloutBatchSize: 256 # Number of targets sampled per PPO update.
+  updateSteps: 20000 # Number of PPO updates to run.
+  ppoEpochs: 4 # Number of optimization passes over each rollout batch.
+  minibatchSize: 128 # Minibatch size used inside each PPO epoch.
+  learningRate: 3.0e-4 # Adam learning rate.
+  clipEpsilon: 0.2 # PPO ratio clipping threshold.
+  valueLossCoef: 0.5 # Weight on the value-function regression loss.
+  entropyCoef: 0.01 # Weight on the policy entropy bonus.
+  maxGradNorm: 0.5 # Gradient clipping threshold.
+  seed: 7 # RNG seed for target sampling and policy action sampling.
+
+# Objective weighting / fidelity settings.
+loss:
+  w_shape: 1.0 # Weight on in-target shape fidelity loss.
+  w_eff: 0.1 # Weight on power-efficiency loss.
+  w_wide: 15 # Weight on outside-support suppression loss.
+  wide_grid_size: 128 # Wide-angle evaluation grid size.
+  wide_support_dilation_cells: 1 # Support-mask dilation radius in wide-grid cells.
+
+# Metrics / dataset logging settings.
+logging:
+  logMode: metrics_only # Logging mode: off, metrics_only, dataset_compact, or dataset_full.
+
+# Checkpoint writing settings.
+checkpoint:
+  checkpointMode: periodic # Checkpoint policy: off or periodic.
+  checkpointEverySteps: 100 # PPO updates between checkpoint writes.
+
+# Background IO worker settings.
+workers:
+  asyncIO: true # Whether checkpoint writes run in background worker processes.
+  datasetWriterWorkers: 1 # Reserved dataset-writer worker count.
+  checkpointWriterWorkers: 1 # Number of async workers used for checkpoints / summaries.
+  ioQueueSize: 2 # Max queue depth for async IO tasks.
+
+# Target corpus source configuration.
+target:
+  manifest: data/targets/simple/manifest.yaml # Manifest listing the target files available for PPO.
+  selection: random_without_replacement # Corpus subset selection strategy at startup.
+  selectionCount: 10000 # Optional cap on how many manifest targets to include from the manifest.
+  decimate: 2 # Spatial decimation factor applied after each target is loaded.
+  loadingMode: block_window # PPO corpus loading strategy; v1 supports block_window only.
+  blockSize: 10000 # Number of decoded targets kept in the active in-memory block.
+  prefetchNextBlock: true # Whether to preload the next block in the background.
+  loaderWorkers: auto # Number of parallel workers for file load + decimate, or auto.
+  shuffleEachEpoch: false # Whether to reshuffle manifest traversal order between epochs.

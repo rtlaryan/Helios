@@ -17,6 +17,7 @@ from scripts.batchFactory import (
 from scripts.coordinateTransforms import LLAtoECEF
 from scripts.targetSpec import TargetBatch, TargetSpec, inferTargetCenter
 from train.config import loadRunConfig, resolveTarget, runConfigToDict
+import train.evolve as evolve_module
 from train.evolve import (
     CheckpointConfig,
     EvolutionConfig,
@@ -829,6 +830,103 @@ def test_train_writes_yaml_dataset_and_checkpoint(tmp_path: Path) -> None:
     dataset = torch.load(datasetPath, weights_only=False)
     record = dataset["records"][0]
     assert set(record["loss"]) == {"total", "shape", "efficiency", "wideSupport"}
+
+
+def test_train_starts_progress_bar_before_initial_population_evaluation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    controller = EvolutionController(
+        config=EvolutionConfig(batchSize=2, evolutionSteps=1),
+        targetSpec=make_target(),
+        arraySpec=make_array_spec(),
+        lossParams=LossConfig(wide_grid_size=8),
+        experimentName="progress_smoke",
+        archiveRoot=tmp_path / "archive",
+        loggingConfig=LoggingConfig(logMode="off"),
+        checkpointConfig=CheckpointConfig(checkpointMode="off"),
+        workerConfig=WorkerConfig(
+            asyncIO=False,
+            datasetWriterWorkers=0,
+            checkpointWriterWorkers=0,
+            ioQueueSize=1,
+        ),
+        writerLogDir=tmp_path / "runs",
+    )
+
+    batch = generateBatch(
+        controller.arraySpec,
+        batchSize=controller.config.batchSize,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        weightsType=controller.config.initialWeightsType,
+    )
+    targetPointCount = make_target().importanceMap.numel()
+    events: list[tuple] = []
+
+    class FakeProgressBar:
+        def __init__(self, *args, total: int, initial: int, desc: str, **kwargs) -> None:
+            events.append(("init", total, initial, desc, kwargs.get("dynamic_ncols")))
+
+        def set_postfix(self, payload: dict[str, str]) -> None:
+            events.append(("set_postfix", payload))
+
+        def set_postfix_str(self, value: str) -> None:
+            events.append(("set_postfix_str", value))
+
+        def refresh(self) -> None:
+            events.append(("refresh",))
+
+        def update(self, n: int = 1) -> None:
+            events.append(("update", n))
+
+        def close(self) -> None:
+            events.append(("close",))
+
+    def fake_population_for_step(active_batch: ArrayBatch, step: int):
+        events.append(
+            (
+                "population",
+                step,
+                any(event[0] == "init" for event in events),
+                any(event[0] == "refresh" for event in events),
+            )
+        )
+        zeros = torch.zeros(active_batch.batchSize, dtype=torch.float32)
+        evaluation = BatchEvaluation(
+            totalLoss=torch.tensor([1.0, 2.0], dtype=torch.float32),
+            shapeLoss=zeros,
+            efficiencyLoss=zeros,
+            wideSupportLoss=zeros,
+            linearResponse=torch.zeros((active_batch.batchSize, 2, 2), dtype=torch.float32),
+            targetAZEL=(
+                torch.zeros((active_batch.batchSize, targetPointCount), dtype=torch.float32),
+                torch.zeros((active_batch.batchSize, targetPointCount), dtype=torch.float32),
+            ),
+            targetMode=controller.targetMode,
+        )
+        return evolve_module.PopulationState(
+            batch=active_batch,
+            evaluation=evaluation,
+            lossParams=controller.lossParams,
+        )
+
+    monkeypatch.setattr(evolve_module, "tqdm", FakeProgressBar)
+    monkeypatch.setattr(controller, "initEvolution", lambda **_: batch)
+    monkeypatch.setattr(controller, "_populationForStep", fake_population_for_step)
+
+    controller.train(
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        logDir=tmp_path / "runs",
+        plotProjection=False,
+        resume=False,
+    )
+
+    populationEvent = next(event for event in events if event[0] == "population")
+    assert populationEvent[2] is True
+    assert populationEvent[3] is True
+    assert ("set_postfix_str", "evaluating") in events
+    assert ("update", 1) in events
 
 
 def test_resume_rejects_mismatched_config(tmp_path: Path) -> None:

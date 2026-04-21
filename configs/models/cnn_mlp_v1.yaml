@@ -1,0 +1,53 @@
+# High-level assembled model name. Today this selects a CNN encoder + flat action decoder stack.
+architecture: cnn_mlp # Registry name of the composed actor-critic builder to instantiate.
+
+# Shared actor-critic settings used across encoder/decoder components.
+common:
+  activation: gelu # Nonlinearity used in configurable encoder / decoder blocks.
+  norm: layernorm # Normalization style applied in configurable decoder MLP blocks.
+  hiddenDim: 256 # Fallback hidden width for decoders that omit explicit MLP layer sizes.
+  logStdMode: global # Policy log-std parameterization: one shared value or per-dimension values.
+  logStdInit: -0.5 # Initial log standard deviation for the Gaussian policy.
+
+# Encoder section: how the target raster is turned into a latent feature vector.
+encoder:
+  type: cnn # Encoder family used by the selected architecture.
+
+  # CNN encoder settings used when encoder.type=cnn.
+  cnn:
+    inChannels: 2 # Number of input channels; PPO currently uses normalized power + importance.
+    convChannels: [16, 32, 64] # Output channels for each convolution stage.
+    kernelSizes: [5, 3, 3] # Kernel size for each convolution stage.
+    strides: [2, 2, 2] # Stride for each convolution stage.
+    paddings: [3, 2, 1] # Padding for each convolution stage.
+    pooling: adaptive_avg # Final spatial pooling mode used to produce one latent vector per target.
+    dropout: 0.0 # Dropout probability applied inside the CNN encoder stack.
+
+  # Future transformer encoder settings; scaffolded but not yet implemented.
+  transformer:
+    patchSize: 4 # Spatial patch size for patch embedding.
+    embedDim: 256 # Transformer token embedding width.
+    depth: 6 # Number of transformer blocks.
+    numHeads: 8 # Number of self-attention heads per block.
+    mlpRatio: 4.0 # Expansion ratio of the transformer feedforward block.
+
+# Decoder section: how the shared latent is turned into policy/value outputs.
+decoder:
+  type: flat_action # Decoder family used by the selected architecture.
+
+  # Flat action decoder settings used when decoder.type=flat_action.
+  flat_action:
+    mlpLayers: [512, 512, 256] # Hidden widths for the post-encoder policy/value trunk.
+    dropout: 0.0 # Dropout probability applied inside the decoder trunk.
+
+  # Coordinate-conditioned decoder settings used when decoder.type=coordinate_conditioned.
+  # This decoder consumes the shared encoder latent plus config-selected array/context features.
+  coordinate_conditioned:
+    mlpLayers: [256, 256] # Hidden widths for the shared per-element decoder MLP.
+    dropout: 0.0 # Dropout probability applied inside the per-element decoder trunk.
+
+# Optional array/satellite context features made available to the model.
+# Flat decoders ignore these today, but coordinate-conditioned decoders consume them.
+context:
+  globalFeatures: [array_lla, array_ecef, element_count, geometry_one_hot] # Choose from: array_lla, array_ecef, gain, wavelength, element_spacing, element_count, geometry_one_hot.
+  elementFeatures: [] # Choose from: element_local_xyz, element_global_xyz, normalized_aperture_xyz, element_mask.

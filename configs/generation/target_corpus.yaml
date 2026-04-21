@@ -1,0 +1,50 @@
+# Number of target samples to generate.
+count: 100000 # Total procedural targets to write into the corpus.
+seed: 7 # RNG seed for reproducible corpus generation.
+workers: auto # Number of parallel workers, or auto to choose automatically.
+
+# Output locations and naming.
+output:
+  root: data/targets/simple # Directory where generated target files are written.
+  manifestPath: data/targets/simple/manifest.yaml # Output manifest path listing generated targets.
+  prefix: target # Filename prefix used for generated target files.
+
+# Shared raster grid definition for every generated target.
+grid:
+  latRange: [0.0, 40.0] # Latitude bounds of the generated target grid in degrees.
+  lonRange: [-80.0, 120.0] # Longitude bounds of the generated target grid in degrees.
+  resolutionDeg: 0.25 # Grid cell spacing in degrees.
+  decimate: 1 # Optional post-generation decimation factor.
+  powerMode: normalized # Output power map mode, e.g. normalized or db.
+
+# Mixture weights over target-generator categories.
+curriculum:
+  weights:
+    single_circle: 1.0 # Relative sampling weight for single circular targets.
+    irregular_shape: 0.0 # Relative sampling weight for irregular composite shapes.
+    multibeam: 0.0 # Relative sampling weight for multibeam targets.
+
+# Per-category generation parameter ranges.
+categories:
+  single_circle:
+    radiusRange: [2.5, 15] # Circle radius range in degrees.
+    rolloffRange: [1, 3] # Edge falloff / smoothness range.
+    peakDBRange: [-3.0, 0.0] # Peak power range in dB for the target interior.
+
+  irregular_shape:
+    componentCountRange: [2, 4] # Number of primitive components used to build the shape.
+    circleComponentProbability: 0.5 # Probability that a component is circular instead of polygonal.
+    radiusRange: [0.75, 5.0] # Radius range for circular components in degrees.
+    polygonRadiusRange: [1.0, 3.0] # Circumradius range for polygon components in degrees.
+    polygonVertexCountRange: [3, 6] # Vertex-count range for polygon components.
+    componentJitterRange: [0.5, 3.5] # Placement jitter range between components in degrees.
+    rolloffRange: [0.3, 1.2] # Edge falloff / blur range for composite shapes.
+    peakDBRange: [-6.0, 0.0] # Peak power range in dB.
+
+  multibeam:
+    beamCountRange: [2, 4] # Number of beams to place in the same target.
+    radiusRange: [2.5, 10] # Individual beam radius range in degrees.
+    rolloffRange: [0.3, 1.2] # Beam edge falloff / smoothness range.
+    peakDBRange: [-3.0, 0.0] # Peak power range in dB.
+    minSeparationDeg: 1 # Minimum center-to-center separation between beams in degrees.
+    placementAttempts: 64 # Number of retries when placing beams without overlap conflicts.

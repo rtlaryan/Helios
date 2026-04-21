@@ -1,0 +1,99 @@
+# Experiment-level runtime settings.
+experiment:
+  name: evo_3_multibeam_new # Experiment name used for run/archive output folders.
+  logDir: data/runs/evolution # TensorBoard and run metadata root directory.
+  archiveDir: data/archive/evolution # Checkpoint / dataset / summary output root directory.
+  resume: false # Whether to resume from an existing checkpoint if present.
+  plotProjection: false # Whether to render projection plots during training.
+  tensorboard: true # Whether TensorBoard logging is enabled.
+  targetMode: shared # How targets are interpreted: shared target or per-sample target batch.
+
+# Device and numeric precision.
+device:
+  device: cuda # Torch device to run training on.
+  dtype: float32 # Floating-point dtype used for simulation and optimization.
+
+# Array search-space definition.
+array:
+  centerFrequency: 30.0e9 # Carrier frequency in Hz.
+  elementSpacingRatio: 0.5 # Element spacing in wavelengths.
+  positionJitterSTD: 0.0 # Standard deviation of element position jitter in meters.
+  phaseJitterSTD: 0.0 # Standard deviation of initialization phase jitter in radians.
+  failRate: 0.0 # Probability that an element is disabled in the sampled array mask.
+  allowedElementCount: [25000] # Allowed element counts to sample from.
+  allowedAspectRatio: [1.0] # Allowed array aspect ratios to sample from.
+  geometry: URA # Array geometry family, e.g. URA or UCA.
+  gainRange: [1.0, 1.0] # Min/max platform gain sampled per array.
+  sparsityRange: [1.0, 1.0] # Min/max active-element fraction sampled per array.
+  latitudeRange: [15.0, 15.0] # Min/max array platform latitude in degrees.
+  longitudeRange: [-83.0, -83.0] # Min/max array platform longitude in degrees.
+  altitudeRange: [5.5e6, 5.5e6] # Min/max array platform altitude in meters.
+
+# Evolutionary optimizer settings.
+evolution:
+  generator: null # Optional explicit torch.Generator seed/state source.
+  batchSize: 40 # Population size evaluated each evolution step.
+  evolutionSteps: 20000 # Number of evolution iterations to run.
+  initialWeightsType: random # Initial weight sampler: random, uniform, or directed.
+  cloneFraction: 0.15 # Fraction of top-ranked samples copied unchanged to the next population.
+  crossoverFraction: 0.15 # Fraction of next population created via parent crossover.
+  mutateFraction: 0.55 # Fraction of next population created via mutation.
+  randomFraction: 0.15 # Fraction of next population injected as fresh random samples.
+  parentPoolFraction: 0.15 # Fraction of best-ranked population eligible for reproduction.
+  phaseSigma: 0.2 # Initial mutation noise scale for phase perturbations.
+  amplitudeSigma: 0.01 # Initial mutation noise scale for amplitude perturbations.
+  gainSigma: 0 # Reserved gain mutation scale.
+  phaseSigmaDecay: 0.9998 # Per-step decay applied to phase mutation sigma.
+  amplitudeSigmaDecay: 0.9995 # Per-step decay applied to amplitude mutation sigma.
+  randomFractionDecay: 0.999 # Per-step decay applied to random injection fraction.
+  phaseMinSigma: 5e-4 # Hard lower bound for phase mutation sigma.
+  amplitudeMinSigma: 5e-5 # Hard lower bound for amplitude mutation sigma.
+  minRandomFraction: 0.02 # Minimum random injection fraction after decay.
+  stagnationWindow: 250 # Number of non-improving steps before exploration boost triggers.
+  sigmaBoostDuration: 25 # Number of steps exploration boost stays active.
+  sigmaBoostMultiplier: 2.0 # Multiplier applied to sigmas during exploration boost.
+  sigmaBoostRandomFraction: 0.15 # Minimum random fraction enforced during boost windows.
+  phaseAdaptiveSigmaFloor: false # Whether phase sigma floor adapts to parent diversity.
+  phaseMinSigmaScale: 0.1 # Scale factor for adaptive phase sigma floor.
+  amplitudeMinSigmaScale: 0.1 # Scale factor for adaptive amplitude sigma floor.
+  wideGridSizeStart: 128 # Initial wide-angle grid size before fidelity ramping.
+  wideGridRampSteps: 4000 # Number of steps used to ramp wide grid size to final value.
+  linearResponseChunkSize: 1000000000 # Chunk cap for target-grid response evaluation.
+  wideResponseChunkSize: 1000000000 # Chunk cap for wide-grid response evaluation.
+  lossType: HUBER # Backward-compatible loss type field; objective uses structured loss terms.
+
+# Objective weighting / fidelity settings.
+loss:
+  w_shape: 1.0 # Weight on in-target shape fidelity loss.
+  w_eff: 0.1 # Weight on power-efficiency loss.
+  w_wide: 15 # Weight on outside-support suppression loss.
+  wide_grid_size: 128 # Final wide-angle evaluation grid size.
+  wide_support_dilation_cells: 1 # Support-mask dilation radius in wide-grid cells.
+
+# Metrics / dataset logging settings.
+logging:
+  logMode: metrics_only # Logging mode: off, metrics_only, dataset_compact, or dataset_full.
+  datasetFlushEverySteps: 10 # Steps between dataset shard flushes when dataset logging is enabled.
+  responseCompactSize: 64 # Pooled response-map size used in compact dataset logging.
+
+# Checkpoint writing settings.
+checkpoint:
+  checkpointMode: periodic # Checkpoint policy: off or periodic.
+  checkpointEverySteps: 100 # Evolution steps between checkpoint writes.
+
+# Background IO worker settings.
+workers:
+  asyncIO: true # Whether checkpoint / dataset writes run in background worker processes.
+  datasetWriterWorkers: 2 # Number of async workers used for dataset shards.
+  checkpointWriterWorkers: 2 # Number of async workers used for checkpoints / summaries.
+  ioQueueSize: 4 # Max queue depth for async IO tasks.
+
+# Target source configuration. Exactly one source mode should be active.
+target:
+  reference: target_spec.pt # Shared target file path.
+  references: null # Optional list of per-sample target paths.
+  inline: null # Optional inline shared target payload.
+  inlineBatch: null # Optional inline per-sample target batch payload.
+  format: null # Optional explicit target format override, e.g. pt or zones_json.
+  resolutionDeg: 0.01 # Resolution used when loading JSON zone targets.
+  decimate: 6 # Spatial decimation factor applied after target load.
