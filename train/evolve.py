@@ -37,6 +37,13 @@ from train.objective import (
     TargetMode,
     evaluateBatch,
 )
+from train.objective_v2 import BatchEvaluationV2, LossConfigV2, evaluateBatchV2
+from train.evaluation_utils import (
+    ObjectiveVersion,
+    evaluation_loss_means,
+    evaluation_loss_record,
+    loss_term_keys_for_objective,
+)
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -58,13 +65,27 @@ try:
 except ModuleNotFoundError:
 
     class _TqdmFallback:
-        def __init__(self, iterable, *args, **kwargs) -> None:
+        def __init__(self, iterable=None, *args, **kwargs) -> None:
             self._iterable = iterable
 
         def __iter__(self):
+            if self._iterable is None:
+                return iter(())
             return iter(self._iterable)
 
         def set_postfix(self, *args, **kwargs) -> None:
+            pass
+
+        def set_postfix_str(self, *args, **kwargs) -> None:
+            pass
+
+        def refresh(self) -> None:
+            pass
+
+        def update(self, n: int = 1) -> None:
+            pass
+
+        def close(self) -> None:
             pass
 
     def tqdm(iterable, *args, **kwargs):  # type: ignore[override]
@@ -103,6 +124,8 @@ _RESUME_MUTABLE_EXPERIMENT_KEYS = {
     "resume",
     "plotProjection",
 }
+ObjectiveBatchEvaluation = BatchEvaluation | BatchEvaluationV2
+ObjectiveLossConfig = LossConfig | LossConfigV2
 
 
 def _writerWorker(queue, timeoutSeconds: float = 0.2) -> None:
@@ -123,6 +146,18 @@ def _writerWorker(queue, timeoutSeconds: float = 0.2) -> None:
         queue.task_done()
 
 
+def _payloadToCPU(payload: Any) -> Any:
+    if isinstance(payload, torch.Tensor):
+        return payload.detach().cpu()
+    if isinstance(payload, dict):
+        return {key: _payloadToCPU(value) for key, value in payload.items()}
+    if isinstance(payload, list):
+        return [_payloadToCPU(value) for value in payload]
+    if isinstance(payload, tuple):
+        return tuple(_payloadToCPU(value) for value in payload)
+    return payload
+
+
 class AsyncWriterPool:
     def __init__(self, workerCount: int, queueSize: int, enabled: bool = True) -> None:
         self.enabled = enabled and workerCount > 0
@@ -134,7 +169,8 @@ class AsyncWriterPool:
         if not self.enabled:
             return
 
-        method = "fork" if "fork" in mp.get_all_start_methods() else "spawn"
+        # Prefer spawn so writer workers stay compatible with CUDA training processes.
+        method = "spawn" if "spawn" in mp.get_all_start_methods() else "fork"
         self.context = mp.get_context(method)
         self.queue = self.context.JoinableQueue(maxsize=queueSize)
 
@@ -144,13 +180,14 @@ class AsyncWriterPool:
             self.processes.append(process)
 
     def submit(self, path: str | Path, payload: Any) -> None:
+        normalizedPayload = _payloadToCPU(payload)
         if not self.enabled:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-            torch.save(payload, path)
+            torch.save(normalizedPayload, path)
             return
 
         assert self.queue is not None
-        self.queue.put((str(path), payload), block=True)
+        self.queue.put((str(path), normalizedPayload), block=True)
 
     def flush(self) -> None:
         if not self.enabled:
@@ -302,8 +339,8 @@ class SchedulerState:
 @dataclass
 class PopulationState:
     batch: ArrayBatch
-    evaluation: BatchEvaluation
-    lossParams: LossConfig
+    evaluation: ObjectiveBatchEvaluation
+    lossParams: ObjectiveLossConfig
 
     @property
     def scores(self) -> torch.Tensor:
@@ -416,29 +453,56 @@ class EvolutionConfig:
         }
 
 
-def _select_evaluation(evaluation: BatchEvaluation, ids: torch.Tensor) -> BatchEvaluation:
-    return BatchEvaluation(
+def _select_evaluation(evaluation: ObjectiveBatchEvaluation, ids: torch.Tensor) -> ObjectiveBatchEvaluation:
+    if isinstance(evaluation, BatchEvaluation):
+        return BatchEvaluation(
+            totalLoss=evaluation.totalLoss[ids],
+            shapeLoss=evaluation.shapeLoss[ids],
+            efficiencyLoss=evaluation.efficiencyLoss[ids],
+            wideSupportLoss=evaluation.wideSupportLoss[ids],
+            linearResponse=evaluation.linearResponse[ids],
+            targetAZEL=(evaluation.targetAZEL[0][ids], evaluation.targetAZEL[1][ids]),
+            targetMode=evaluation.targetMode,
+        )
+    return BatchEvaluationV2(
         totalLoss=evaluation.totalLoss[ids],
         shapeLoss=evaluation.shapeLoss[ids],
-        efficiencyLoss=evaluation.efficiencyLoss[ids],
-        wideSupportLoss=evaluation.wideSupportLoss[ids],
+        coverageLoss=evaluation.coverageLoss[ids],
+        shellLoss=evaluation.shellLoss[ids],
+        globalLoss=evaluation.globalLoss[ids],
+        peakLoss=evaluation.peakLoss[ids],
         linearResponse=evaluation.linearResponse[ids],
         targetAZEL=(evaluation.targetAZEL[0][ids], evaluation.targetAZEL[1][ids]),
         targetMode=evaluation.targetMode,
     )
 
 
-def _merge_evaluations(evaluations: list[BatchEvaluation]) -> BatchEvaluation:
+def _merge_evaluations(evaluations: list[ObjectiveBatchEvaluation]) -> ObjectiveBatchEvaluation:
     if not evaluations:
         raise ValueError("evaluations must not be empty")
     reference = evaluations[0]
-    return BatchEvaluation(
+    if isinstance(reference, BatchEvaluation):
+        return BatchEvaluation(
+            totalLoss=torch.cat([evaluation.totalLoss for evaluation in evaluations], dim=0),
+            shapeLoss=torch.cat([evaluation.shapeLoss for evaluation in evaluations], dim=0),
+            efficiencyLoss=torch.cat([evaluation.efficiencyLoss for evaluation in evaluations], dim=0),
+            wideSupportLoss=torch.cat(
+                [evaluation.wideSupportLoss for evaluation in evaluations], dim=0
+            ),
+            linearResponse=torch.cat([evaluation.linearResponse for evaluation in evaluations], dim=0),
+            targetAZEL=(
+                torch.cat([evaluation.targetAZEL[0] for evaluation in evaluations], dim=0),
+                torch.cat([evaluation.targetAZEL[1] for evaluation in evaluations], dim=0),
+            ),
+            targetMode=reference.targetMode,
+        )
+    return BatchEvaluationV2(
         totalLoss=torch.cat([evaluation.totalLoss for evaluation in evaluations], dim=0),
         shapeLoss=torch.cat([evaluation.shapeLoss for evaluation in evaluations], dim=0),
-        efficiencyLoss=torch.cat([evaluation.efficiencyLoss for evaluation in evaluations], dim=0),
-        wideSupportLoss=torch.cat(
-            [evaluation.wideSupportLoss for evaluation in evaluations], dim=0
-        ),
+        coverageLoss=torch.cat([evaluation.coverageLoss for evaluation in evaluations], dim=0),
+        shellLoss=torch.cat([evaluation.shellLoss for evaluation in evaluations], dim=0),
+        globalLoss=torch.cat([evaluation.globalLoss for evaluation in evaluations], dim=0),
+        peakLoss=torch.cat([evaluation.peakLoss for evaluation in evaluations], dim=0),
         linearResponse=torch.cat([evaluation.linearResponse for evaluation in evaluations], dim=0),
         targetAZEL=(
             torch.cat([evaluation.targetAZEL[0] for evaluation in evaluations], dim=0),
@@ -453,7 +517,8 @@ class EvolutionController:
     config: EvolutionConfig
     targetSpec: TargetLike
     arraySpec: ArraySpec
-    lossParams: LossConfig
+    lossParams: ObjectiveLossConfig
+    objectiveVersion: ObjectiveVersion = "v1"
     experimentName: str = "evo_1"
     archiveRoot: str | Path = "data/archive"
     loggingConfig: LoggingConfig = field(default_factory=LoggingConfig)
@@ -641,9 +706,9 @@ class EvolutionController:
         self,
         step: int,
         scores: torch.Tensor,
-        evaluation: BatchEvaluation,
+        evaluation: ObjectiveBatchEvaluation,
         schedulerState: SchedulerState,
-        lossParams: LossConfig,
+        lossParams: ObjectiveLossConfig,
         parentPhaseStd: float,
         parentAmplitudeStd: float,
     ) -> dict:
@@ -659,16 +724,17 @@ class EvolutionController:
             "medianScore": float(scores.median().item()),
             "worstScore": float(scores[worstIdx].item()),
             "stdScore": float(scores.std(unbiased=False).item()),
-            "shapeLoss": float(evaluation.shapeLoss.mean().item()),
-            "efficiencyLoss": float(evaluation.efficiencyLoss.mean().item()),
-            "wideSupportLoss": float(evaluation.wideSupportLoss.mean().item()),
             "phaseSigma": schedulerState.currentPhaseSigma,
             "amplitudeSigma": schedulerState.currentAmplitudeSigma,
             "randomFraction": schedulerState.currentRandomFraction,
-            "wideGridSize": int(lossParams.wide_grid_size),
             "parentPhaseStd": parentPhaseStd,
             "parentAmplitudeStd": parentAmplitudeStd,
         }
+        for name, value in evaluation_loss_means(evaluation).items():
+            summary[f"{name}Loss"] = value
+        if self.objectiveVersion == "v1":
+            assert isinstance(lossParams, LossConfig)
+            summary["wideGridSize"] = int(lossParams.wide_grid_size)
         return summary
 
     def _logMetrics(self, step: int, summary: dict[str, Any]) -> None:
@@ -679,13 +745,15 @@ class EvolutionController:
         self.writer.add_scalar("Score/Mean", summary["meanScore"], step)
         self.writer.add_scalar("Score/Worst", summary["worstScore"], step)
         self.writer.add_scalar("Score/Std", summary["stdScore"], step)
-        self.writer.add_scalar("Loss/Shape", summary["shapeLoss"], step)
-        self.writer.add_scalar("Loss/Efficiency", summary["efficiencyLoss"], step)
-        self.writer.add_scalar("Loss/WideSupport", summary["wideSupportLoss"], step)
+        for name in loss_term_keys_for_objective(self.objectiveVersion):
+            metricKey = f"{name}Loss"
+            if metricKey in summary:
+                self.writer.add_scalar(f"Loss/{name[0].upper()}{name[1:]}", summary[metricKey], step)
         self.writer.add_scalar("Param/PhaseSigma", summary["phaseSigma"], step)
         self.writer.add_scalar("Param/AmplitudeSigma", summary["amplitudeSigma"], step)
         self.writer.add_scalar("Param/RandomFraction", summary["randomFraction"], step)
-        self.writer.add_scalar("Param/WideGridSize", summary["wideGridSize"], step)
+        if "wideGridSize" in summary:
+            self.writer.add_scalar("Param/WideGridSize", summary["wideGridSize"], step)
         self.writer.add_scalar("Parent/PhaseStd", summary["parentPhaseStd"], step)
         self.writer.add_scalar("Parent/AmplitudeStd", summary["parentAmplitudeStd"], step)
 
@@ -715,7 +783,7 @@ class EvolutionController:
         return payload
 
     def _bufferDatasetRecords(
-        self, step: int, batch: ArrayBatch, evaluation: BatchEvaluation
+        self, step: int, batch: ArrayBatch, evaluation: ObjectiveBatchEvaluation
     ) -> None:
         if self.loggingConfig.logMode not in {"dataset_compact", "dataset_full"}:
             return
@@ -730,12 +798,7 @@ class EvolutionController:
                 "sampleID": sampleIdx,
                 "array": batch.serializeBatchSample(sampleIdx),
                 "response": self._serializeResponsePayload(evaluation.linearResponse[sampleIdx]),
-                "loss": {
-                    "total": float(evaluation.totalLoss[sampleIdx].item()),
-                    "shape": float(evaluation.shapeLoss[sampleIdx].item()),
-                    "efficiency": float(evaluation.efficiencyLoss[sampleIdx].item()),
-                    "wideSupport": float(evaluation.wideSupportLoss[sampleIdx].item()),
-                },
+                "loss": evaluation_loss_record(evaluation, sampleIdx),
             }
 
             if sharedTarget is None:
@@ -817,6 +880,8 @@ class EvolutionController:
         self.checkpointWriter.submit(self.bestPath, samplePayload)
 
     def _wideGridSizeAt(self, step: int) -> int:
+        if self.objectiveVersion != "v1":
+            raise RuntimeError("_wideGridSizeAt is only valid for objectiveVersion='v1'")
         finalSize = int(self.lossParams.wide_grid_size)
         startSize = self.config.wideGridSizeStart
         if startSize is None or startSize == finalSize:
@@ -832,7 +897,9 @@ class EvolutionController:
         interpolated = startSize + (finalSize - startSize) * progress
         return int(round(interpolated))
 
-    def _lossParamsForStep(self, step: int) -> LossConfig:
+    def _lossParamsForStep(self, step: int) -> ObjectiveLossConfig:
+        if self.objectiveVersion != "v1":
+            return self.lossParams
         activeWideGridSize = self._wideGridSizeAt(step)
         if activeWideGridSize == self.lossParams.wide_grid_size:
             return self.lossParams
@@ -895,9 +962,24 @@ class EvolutionController:
             "historyWorst": historyWorst,
         }
 
-    def evaluate(self, batch: ArrayBatch, lossParams: LossConfig | None = None) -> BatchEvaluation:
+    def evaluate(
+        self,
+        batch: ArrayBatch,
+        lossParams: ObjectiveLossConfig | None = None,
+    ) -> ObjectiveBatchEvaluation:
         activeLossParams = self.lossParams if lossParams is None else lossParams
-        return evaluateBatch(
+        if self.objectiveVersion == "v1":
+            assert isinstance(activeLossParams, LossConfig)
+            return evaluateBatch(
+                batch=batch,
+                target=self.targetSpec,
+                params=activeLossParams,
+                targetMode=self.targetMode,
+                linearResponseChunkSize=self.config.linearResponseChunkSize,
+                wideResponseChunkSize=self.config.wideResponseChunkSize,
+            )
+        assert isinstance(activeLossParams, LossConfigV2)
+        return evaluateBatchV2(
             batch=batch,
             target=self.targetSpec,
             params=activeLossParams,
@@ -1203,6 +1285,7 @@ class EvolutionController:
             self._writeRunConfig(runPath, resume=activeResume)
 
         self._startWriters()
+        pbar = None
 
         try:
             resumeState = self.loadResumeState(device=device) if activeResume else None
@@ -1247,13 +1330,16 @@ class EvolutionController:
             ):
                 self.writer = SummaryWriter(log_dir=str(runPath), purge_step=startStep)
 
-            population = self._populationForStep(batch, startStep)
-
             pbar = tqdm(
-                range(startStep, self.config.evolutionSteps),
+                total=self.config.evolutionSteps,
+                initial=startStep,
                 desc=f"Evolving {self.experimentName}",
+                dynamic_ncols=True,
             )
-            for step in pbar:
+            pbar.set_postfix_str("evaluating")
+            pbar.refresh()
+            population = self._populationForStep(batch, startStep)
+            for step in range(startStep, self.config.evolutionSteps):
                 evaluation = population.evaluation
                 scores = population.scores
                 sortedScoresIDs = torch.argsort(scores, dim=0, descending=False)
@@ -1341,6 +1427,7 @@ class EvolutionController:
                 if nextPopulation is not None:
                     population = nextPopulation
                     schedulerState = nextSchedulerState
+                pbar.update(1)
 
             self._flushDatasetBuffer()
 
@@ -1364,6 +1451,8 @@ class EvolutionController:
 
             return finalPayload
         finally:
+            if pbar is not None:
+                pbar.close()
             if self.writer:
                 self.writer.close()
                 self.writer = None
@@ -1382,7 +1471,8 @@ def buildControllerFromConfig(
         config=runConfig.evolution,
         targetSpec=target,
         arraySpec=runConfig.array,
-        lossParams=runConfig.loss,
+        lossParams=runConfig.loss if runConfig.objectiveVersion == "v1" else runConfig.lossV2,
+        objectiveVersion=runConfig.objectiveVersion,
         experimentName=runConfig.experiment.name,
         archiveRoot=runConfig.experiment.archiveDir,
         loggingConfig=runConfig.logging,
