@@ -4,6 +4,7 @@ import argparse
 import multiprocessing as mp
 import re
 import shutil
+import sys
 from dataclasses import dataclass, field, replace
 from multiprocessing.process import BaseProcess
 from pathlib import Path
@@ -39,11 +40,13 @@ from train.objective import (
 )
 from train.objective_v2 import BatchEvaluationV2, LossConfigV2, evaluateBatchV2
 from train.evaluation_utils import (
+    evaluation_diagnostic_means,
     ObjectiveVersion,
-    evaluation_loss_means,
+    evaluation_weighted_loss_means,
     evaluation_loss_record,
     loss_term_keys_for_objective,
 )
+from simulation.response import SimulationBackend
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -97,6 +100,7 @@ _FLOAT_PATTERN = re.compile(r"^[+-]?(?:\d+\.\d*|\d+|\.\d+)(?:[eE][+-]?\d+)?$")
 LogMode = Literal["off", "metrics_only", "dataset_compact", "dataset_full"]
 CheckpointMode = Literal["off", "periodic"]
 _RESUME_MUTABLE_EVOLUTION_KEYS = {
+    "evolutionSteps",
     "initialWeightsType",
     "phaseSigma",
     "amplitudeSigma",
@@ -283,9 +287,12 @@ def _normalize_config_payload(payload: Any) -> Any:
 
 def _comparison_config_payload(payload: Any, allowResumeMutation: bool = False) -> Any:
     normalized = _normalize_config_payload(payload)
+    if isinstance(normalized, dict):
+        normalized.setdefault("simulation", {"backend": "v1"})
     if not allowResumeMutation or not isinstance(normalized, dict):
         return normalized
 
+    objectiveVersion = normalized.get("objectiveVersion")
     experimentConfig = normalized.get("experiment")
     if isinstance(experimentConfig, dict):
         for key in _RESUME_MUTABLE_EXPERIMENT_KEYS:
@@ -295,6 +302,11 @@ def _comparison_config_payload(payload: Any, allowResumeMutation: bool = False) 
     if isinstance(evolutionConfig, dict):
         for key in _RESUME_MUTABLE_EVOLUTION_KEYS:
             evolutionConfig.pop(key, None)
+        # The v2 reference YAML intentionally omits the legacy v1-only lossType
+        # field, while the resolved dataclass payload still carries its default.
+        # Ignore it so resume validation compares the meaningful config shape.
+        if objectiveVersion == "v2":
+            evolutionConfig.pop("lossType", None)
     return normalized
 
 
@@ -467,7 +479,8 @@ def _select_evaluation(evaluation: ObjectiveBatchEvaluation, ids: torch.Tensor) 
     return BatchEvaluationV2(
         totalLoss=evaluation.totalLoss[ids],
         shapeLoss=evaluation.shapeLoss[ids],
-        coverageLoss=evaluation.coverageLoss[ids],
+        efficiencyLoss=evaluation.efficiencyLoss[ids],
+        nullPenaltyLoss=evaluation.nullPenaltyLoss[ids],
         shellLoss=evaluation.shellLoss[ids],
         globalLoss=evaluation.globalLoss[ids],
         peakLoss=evaluation.peakLoss[ids],
@@ -499,7 +512,8 @@ def _merge_evaluations(evaluations: list[ObjectiveBatchEvaluation]) -> Objective
     return BatchEvaluationV2(
         totalLoss=torch.cat([evaluation.totalLoss for evaluation in evaluations], dim=0),
         shapeLoss=torch.cat([evaluation.shapeLoss for evaluation in evaluations], dim=0),
-        coverageLoss=torch.cat([evaluation.coverageLoss for evaluation in evaluations], dim=0),
+        efficiencyLoss=torch.cat([evaluation.efficiencyLoss for evaluation in evaluations], dim=0),
+        nullPenaltyLoss=torch.cat([evaluation.nullPenaltyLoss for evaluation in evaluations], dim=0),
         shellLoss=torch.cat([evaluation.shellLoss for evaluation in evaluations], dim=0),
         globalLoss=torch.cat([evaluation.globalLoss for evaluation in evaluations], dim=0),
         peakLoss=torch.cat([evaluation.peakLoss for evaluation in evaluations], dim=0),
@@ -519,6 +533,7 @@ class EvolutionController:
     arraySpec: ArraySpec
     lossParams: ObjectiveLossConfig
     objectiveVersion: ObjectiveVersion = "v1"
+    simulationBackend: SimulationBackend = "v1"
     experimentName: str = "evo_1"
     archiveRoot: str | Path = "data/archive"
     loggingConfig: LoggingConfig = field(default_factory=LoggingConfig)
@@ -647,6 +662,7 @@ class EvolutionController:
             LLAPosition=LLAPosition,
             ECEFPosition=ECEFPosition,
             elementMask=elementMask,
+            geometryCacheKey=templateBatch.geometryCacheKey,
         )
 
     def _startWriters(self) -> None:
@@ -730,8 +746,10 @@ class EvolutionController:
             "parentPhaseStd": parentPhaseStd,
             "parentAmplitudeStd": parentAmplitudeStd,
         }
-        for name, value in evaluation_loss_means(evaluation).items():
+        for name, value in evaluation_weighted_loss_means(evaluation, lossParams).items():
             summary[f"{name}Loss"] = value
+        for name, value in evaluation_diagnostic_means(evaluation).items():
+            summary[f"{name}Metric"] = value
         if self.objectiveVersion == "v1":
             assert isinstance(lossParams, LossConfig)
             summary["wideGridSize"] = int(lossParams.wide_grid_size)
@@ -749,6 +767,10 @@ class EvolutionController:
             metricKey = f"{name}Loss"
             if metricKey in summary:
                 self.writer.add_scalar(f"Loss/{name[0].upper()}{name[1:]}", summary[metricKey], step)
+        for key, value in summary.items():
+            if key.endswith("Metric"):
+                diagnosticName = key.removesuffix("Metric")
+                self.writer.add_scalar(f"Diagnostics/{diagnosticName}", value, step)
         self.writer.add_scalar("Param/PhaseSigma", summary["phaseSigma"], step)
         self.writer.add_scalar("Param/AmplitudeSigma", summary["amplitudeSigma"], step)
         self.writer.add_scalar("Param/RandomFraction", summary["randomFraction"], step)
@@ -977,6 +999,7 @@ class EvolutionController:
                 targetMode=self.targetMode,
                 linearResponseChunkSize=self.config.linearResponseChunkSize,
                 wideResponseChunkSize=self.config.wideResponseChunkSize,
+                simulationBackend=self.simulationBackend,
             )
         assert isinstance(activeLossParams, LossConfigV2)
         return evaluateBatchV2(
@@ -986,6 +1009,7 @@ class EvolutionController:
             targetMode=self.targetMode,
             linearResponseChunkSize=self.config.linearResponseChunkSize,
             wideResponseChunkSize=self.config.wideResponseChunkSize,
+            simulationBackend=self.simulationBackend,
         )
 
     def _populationForStep(self, batch: ArrayBatch, step: int) -> PopulationState:
@@ -1126,8 +1150,6 @@ class EvolutionController:
 
         boostStepsRemaining = max(currentState.boostStepsRemaining - 1, 0)
         stagnationCount = 0 if improved else currentState.stagnationCount + 1
-        if improved:
-            boostStepsRemaining = 0
 
         if (
             not improved
@@ -1139,17 +1161,27 @@ class EvolutionController:
             stagnationCount = 0
 
         if boostStepsRemaining > 0:
+            # Decay the boost smoothly instead of dropping it immediately after
+            # the first improving step.
+            boostStrength = min(
+                1.0,
+                boostStepsRemaining / max(self.config.sigmaBoostDuration, 1),
+            )
+            boostMultiplier = 1.0 + (self.config.sigmaBoostMultiplier - 1.0) * boostStrength
             if self.config.phaseSigma > 0:
                 nextPhaseSigma = min(
                     self.config.phaseSigma,
-                    nextPhaseSigma * self.config.sigmaBoostMultiplier,
+                    nextPhaseSigma * boostMultiplier,
                 )
             if self.config.amplitudeSigma > 0:
                 nextAmplitudeSigma = min(
                     self.config.amplitudeSigma,
-                    nextAmplitudeSigma * self.config.sigmaBoostMultiplier,
+                    nextAmplitudeSigma * boostMultiplier,
                 )
-            nextRandomFraction = max(nextRandomFraction, self.config.sigmaBoostRandomFraction)
+            if self.config.sigmaBoostRandomFraction > nextRandomFraction:
+                nextRandomFraction = nextRandomFraction + (
+                    self.config.sigmaBoostRandomFraction - nextRandomFraction
+                ) * boostStrength
 
         return SchedulerState(
             currentPhaseSigma=nextPhaseSigma,
@@ -1181,7 +1213,7 @@ class EvolutionController:
             cloneIDs = sortedScoresIDs[: counts.cloneCount]
             clones = batch.fetch(cloneIDs)
             nextBatches.append(clones)
-            if self._wideGridSizeAt(step) == self._wideGridSizeAt(step + 1):
+            if self.objectiveVersion != "v1" or self._wideGridSizeAt(step) == self._wideGridSizeAt(step + 1):
                 clonedEvaluations.append(_select_evaluation(population.evaluation, cloneIDs))
 
         if counts.crossoverCount > 0:
@@ -1240,7 +1272,10 @@ class EvolutionController:
         if (
             counts.cloneCount > 0
             and clonedEvaluations
-            and nextLossParams.wide_grid_size == population.lossParams.wide_grid_size
+            and (
+                self.objectiveVersion != "v1"
+                or nextLossParams.wide_grid_size == population.lossParams.wide_grid_size
+            )
         ):
             if offspringBatches:
                 offspringBatch = merge(offspringBatches)
@@ -1473,6 +1508,7 @@ def buildControllerFromConfig(
         arraySpec=runConfig.array,
         lossParams=runConfig.loss if runConfig.objectiveVersion == "v1" else runConfig.lossV2,
         objectiveVersion=runConfig.objectiveVersion,
+        simulationBackend=runConfig.simulation.backend,
         experimentName=runConfig.experiment.name,
         archiveRoot=runConfig.experiment.archiveDir,
         loggingConfig=runConfig.logging,
@@ -1486,12 +1522,53 @@ def buildControllerFromConfig(
     return controller, (device, dtype, runConfig.experiment)
 
 
+def _path_has_existing_data(path: Path | None) -> bool:
+    if path is None or not path.exists():
+        return False
+    if path.is_file():
+        return True
+    return any(path.iterdir())
+
+
+def _confirm_reset_if_needed(
+    controller: EvolutionController,
+    logDir: str | Path | None,
+) -> None:
+    existingPaths: list[Path] = []
+    if _path_has_existing_data(controller.archiveLocation):
+        existingPaths.append(controller.archiveLocation)
+
+    runPath = controller.runLocation(logDir)
+    if _path_has_existing_data(runPath):
+        existingPaths.append(runPath)
+
+    if not existingPaths:
+        return
+
+    if not sys.stdin.isatty():
+        joinedPaths = ", ".join(str(path) for path in existingPaths)
+        raise SystemExit(
+            "resume is false but existing experiment data was found at "
+            f"{joinedPaths}; rerun interactively to confirm deletion or remove it manually"
+        )
+
+    print("resume is false and existing experiment data was found:")
+    for path in existingPaths:
+        print(f"  {path}")
+    try:
+        input("Press Enter to delete it and start fresh, or Ctrl-C to cancel.")
+    except KeyboardInterrupt as exc:
+        raise SystemExit(1) from exc
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run Helios evolution from YAML config")
     parser.add_argument("--config", required=True, help="Path to YAML config")
     args = parser.parse_args()
 
     controller, (device, dtype, experiment) = buildControllerFromConfig(args.config)
+    if not experiment.resume:
+        _confirm_reset_if_needed(controller, experiment.logDir)
     controller.train(
         dtype=dtype,
         device=device,

@@ -8,6 +8,8 @@ from .arraySim import normalizePower as normalizePower
 from .arraySim import resolveChunkSize as resolveChunkSize
 from .arraySim import todB as todB
 from .arraySim import toLinear as toLinear
+from .response import responseBatch as responseBatch
+from .response import responseBatchSharedGrid as responseBatchSharedGrid
 
 __all__ = [
     "arrayResponseBatch",
@@ -17,6 +19,8 @@ __all__ = [
     "arrayResponseSample",
     "chooseChunkShape",
     "normalizePower",
+    "responseBatch",
+    "responseBatchSharedGrid",
     "resolveChunkSize",
     "toLinear",
     "todB",

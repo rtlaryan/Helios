@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import pytest
 import torch
+from scripts.arrayBatch import ArrayBatch
 from simulation.arraySim import (
     arrayResponseCore,
     arrayResponseCoreSharedGrid,
     chooseChunkShape,
 )
+from simulation.arraySimV2 import arrayResponseBatchSharedGridV2
+from simulation.response import responseBatch, responseBatchSharedGrid
 
 
 def _array_response_core_reference(
@@ -191,3 +194,86 @@ def test_choose_chunk_shape_falls_back_to_batch_split_when_needed() -> None:
     assert bc == 4
     assert pc == 1
     assert bc * nc * pc <= 4_096
+
+
+def _batch_from_inputs(inputs: dict[str, torch.Tensor | float]) -> ArrayBatch:
+    element_local_position = inputs["elementLocalPosition"]
+    weights = inputs["weights"]
+    gain = inputs["gain"]
+    assert isinstance(element_local_position, torch.Tensor)
+    assert isinstance(weights, torch.Tensor)
+    assert isinstance(gain, torch.Tensor)
+    return ArrayBatch(
+        elementLocalPosition=element_local_position,
+        weights=weights,
+        wavelength=float(inputs["wavelength"]),
+        gain=gain,
+        LLAPosition=torch.zeros((element_local_position.shape[0], 3), device=weights.device),
+        ECEFPosition=torch.zeros((element_local_position.shape[0], 3), device=weights.device),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton v2")
+def test_array_response_v2_shared_grid_matches_chunked_v1_on_cuda() -> None:
+    inputs = _make_response_inputs(torch.device("cuda"), batched_grid=False)
+    batch = _batch_from_inputs(inputs)
+    azimuth = inputs["azimuth"]
+    elevation = inputs["elevation"]
+    assert isinstance(azimuth, torch.Tensor)
+    assert isinstance(elevation, torch.Tensor)
+
+    expected = responseBatchSharedGrid(
+        batch,
+        (azimuth, elevation),
+        backend="v1",
+        dB=True,
+        normalize=True,
+        chunkSize=37,
+    )
+    actual = arrayResponseBatchSharedGridV2(
+        batch,
+        (azimuth, elevation),
+        dB=True,
+        normalize=True,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-4)
+
+
+def test_array_response_v2_fails_on_cpu() -> None:
+    inputs = _make_response_inputs(torch.device("cpu"), batched_grid=False)
+    batch = _batch_from_inputs(inputs)
+    azimuth = inputs["azimuth"]
+    elevation = inputs["elevation"]
+    assert isinstance(azimuth, torch.Tensor)
+    assert isinstance(elevation, torch.Tensor)
+
+    with pytest.raises(RuntimeError, match="requires a CUDA ArrayBatch"):
+        responseBatchSharedGrid(batch, (azimuth, elevation), backend="v2")
+
+
+def test_array_response_v2_fails_for_batched_grid_on_cuda_when_available() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for Triton v2 batched-grid validation")
+
+    inputs = _make_response_inputs(torch.device("cuda"), batched_grid=True)
+    batch = _batch_from_inputs(inputs)
+    azimuth = inputs["azimuth"]
+    elevation = inputs["elevation"]
+    assert isinstance(azimuth, torch.Tensor)
+    assert isinstance(elevation, torch.Tensor)
+
+    with pytest.raises(ValueError, match="shared az/el grids only"):
+        responseBatchSharedGrid(batch, (azimuth, elevation), backend="v2")
+
+
+def test_response_batch_v2_fails_for_per_sample_grid() -> None:
+    inputs = _make_response_inputs(torch.device("cpu"), batched_grid=True)
+    batch = _batch_from_inputs(inputs)
+    azimuth = inputs["azimuth"]
+    elevation = inputs["elevation"]
+    assert isinstance(azimuth, torch.Tensor)
+    assert isinstance(elevation, torch.Tensor)
+
+    with pytest.raises(ValueError, match="does not support batched"):
+        responseBatch(batch, (azimuth, elevation), backend="v2")

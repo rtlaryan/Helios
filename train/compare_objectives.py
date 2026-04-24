@@ -89,6 +89,7 @@ def _evaluate_objective(
             targetMode=config.experiment.targetMode,
             linearResponseChunkSize=config.evolution.linearResponseChunkSize,
             wideResponseChunkSize=config.evolution.wideResponseChunkSize,
+            simulationBackend=config.simulation.backend,
         )
     if objectiveVersion == "v2":
         return evaluateBatchV2(
@@ -99,6 +100,7 @@ def _evaluate_objective(
             linearResponseChunkSize=config.evolution.linearResponseChunkSize,
             wideResponseChunkSize=config.evolution.wideResponseChunkSize,
             collectStats=collectStats,
+            simulationBackend=config.simulation.backend,
         )
     raise ValueError(f"unsupported objectiveVersion: {objectiveVersion}")
 

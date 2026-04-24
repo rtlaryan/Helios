@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from scripts.arrayBatch import ArrayBatch
 from scripts.coordinateTransforms import LLAtoECEF, getECEFtoENUMapping, mapLLAtoArrayAZEL
 from scripts.targetSpec import TargetBatch, TargetLike, TargetSpec
-from simulation.arraySim import arrayResponseBatch, arrayResponseBatchSharedGrid
+from simulation.response import SimulationBackend, responseBatch, responseBatchSharedGrid
 
 LossType = Literal["MSE", "HUBER"]  # kept for backward compat, unused internally
 TargetMode = Literal["auto", "shared", "per_sample"]
@@ -170,11 +170,13 @@ def _wideAreaResponse(
     batch: ArrayBatch,
     gridSize: int,
     chunkSize: int | None = None,
+    simulationBackend: SimulationBackend = "v1",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     wideAZGrid, wideELGrid = _getWideGrid(batch.device, batch.dtype, gridSize)
-    wideResponse = arrayResponseBatchSharedGrid(
+    wideResponse = responseBatchSharedGrid(
         batch,
         (wideAZGrid, wideELGrid),
+        backend=simulationBackend,
         chunkSize=chunkSize,
     )
     return wideResponse, wideAZGrid, wideELGrid
@@ -291,6 +293,7 @@ def evaluateBatch(
     linearResponseChunkSize: int | None = None,
     wideResponseChunkSize: int | None = None,
     allowSharedTargetFastPath: bool = True,
+    simulationBackend: SimulationBackend = "v1",
 ) -> BatchEvaluation:
     resolvedMode = _resolveTargetMode(target, targetMode)
     target = target.to(batch.device, batch.dtype)
@@ -307,16 +310,18 @@ def evaluateBatch(
             sharedAZ.unsqueeze(0).expand(batch.batchSize, -1),
             sharedEL.unsqueeze(0).expand(batch.batchSize, -1),
         )
-        linearResponse = arrayResponseBatchSharedGrid(
+        linearResponse = responseBatchSharedGrid(
             batch,
             (sharedAZ, sharedEL),
+            backend=simulationBackend,
             chunkSize=linearResponseChunkSize,
         ).reshape(batch.batchSize, *prep.targetShape)
     else:
         targetAZEL = mapLLAtoArrayAZEL(batch, prep.targetCoordinates)
-        linearResponse = arrayResponseBatch(
+        linearResponse = responseBatch(
             batch,
             targetAZEL,
+            backend=simulationBackend,
             chunkSize=linearResponseChunkSize,
         ).reshape(batch.batchSize, *prep.targetShape)
 
@@ -324,6 +329,7 @@ def evaluateBatch(
         batch,
         gridSize=params.wide_grid_size,
         chunkSize=wideResponseChunkSize,
+        simulationBackend=simulationBackend,
     )
 
     if useSharedTargetFastPath:
@@ -388,6 +394,7 @@ def batchLoss(
     linearResponseChunkSize: int | None = None,
     wideResponseChunkSize: int | None = None,
     allowSharedTargetFastPath: bool = True,
+    simulationBackend: SimulationBackend = "v1",
 ) -> torch.Tensor:
     del lossType
     return evaluateBatch(
@@ -399,4 +406,5 @@ def batchLoss(
         linearResponseChunkSize=linearResponseChunkSize,
         wideResponseChunkSize=wideResponseChunkSize,
         allowSharedTargetFastPath=allowSharedTargetFastPath,
+        simulationBackend=simulationBackend,
     ).totalLoss

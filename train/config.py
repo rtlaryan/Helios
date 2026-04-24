@@ -12,6 +12,7 @@ import torch
 import yaml
 from model.config import ModelConfig, loadModelConfig, modelConfigToDict
 from scripts.arraySpec import ArraySpec
+from simulation.response import SimulationBackend
 from scripts.target_generation import load_target_from_zones_json
 from scripts.targetSpec import TargetBatch, TargetLike, TargetSpec
 from train.evaluation_utils import ObjectiveVersion
@@ -89,6 +90,11 @@ class PPOConfig:
 
 
 @dataclass
+class SimulationConfig:
+    backend: SimulationBackend = "v1"
+
+
+@dataclass
 class RunConfig:
     experiment: ExperimentConfig
     device: DeviceConfig
@@ -98,6 +104,7 @@ class RunConfig:
     checkpoint: CheckpointConfig
     workers: WorkerConfig
     target: TargetConfig
+    simulation: SimulationConfig
     objectiveVersion: ObjectiveVersion = "v1"
     loss: LossConfig | None = None
     lossV2: LossConfigV2 | None = None
@@ -116,6 +123,7 @@ class PPORunConfig:
     checkpoint: CheckpointConfig
     workers: WorkerConfig
     target: TargetConfig
+    simulation: SimulationConfig
     objectiveVersion: ObjectiveVersion = "v1"
     loss: LossConfig | None = None
     lossV2: LossConfigV2 | None = None
@@ -197,6 +205,10 @@ def buildRunConfig(payload: dict[str, Any]) -> RunConfig:
     )
     device = _coerce_dataclass(DeviceConfig, _ensure_dict(payload.get("device"), "device"))
     array = _coerce_dataclass(ArraySpec, _ensure_dict(payload.get("array"), "array"))
+    simulation = _coerce_dataclass(
+        SimulationConfig,
+        _ensure_dict(payload.get("simulation"), "simulation"),
+    )
     evolution = _coerce_dataclass(
         EvolutionConfig,
         evolutionPayload,
@@ -238,6 +250,7 @@ def buildRunConfig(payload: dict[str, Any]) -> RunConfig:
         checkpoint=checkpoint,
         workers=workers,
         target=target,
+        simulation=simulation,
     )
     validateRunConfig(config)
     return config
@@ -260,6 +273,10 @@ def buildPPORunConfig(payload: dict[str, Any], basePath: Path | None = None) -> 
     )
     device = _coerce_dataclass(DeviceConfig, _ensure_dict(payload.get("device"), "device"))
     array = _coerce_dataclass(ArraySpec, _ensure_dict(payload.get("array"), "array"))
+    simulation = _coerce_dataclass(
+        SimulationConfig,
+        _ensure_dict(payload.get("simulation"), "simulation"),
+    )
     ppo = _coerce_dataclass(PPOConfig, _ensure_dict(payload.get("ppo"), "ppo"))
     objectiveVersion = payload.get("objectiveVersion", "v1")
     if objectiveVersion not in {"v1", "v2"}:
@@ -301,6 +318,7 @@ def buildPPORunConfig(payload: dict[str, Any], basePath: Path | None = None) -> 
         checkpoint=checkpoint,
         workers=workers,
         target=target,
+        simulation=simulation,
         modelSourcePath=modelPath,
     )
     validatePPORunConfig(config)
@@ -308,6 +326,8 @@ def buildPPORunConfig(payload: dict[str, Any], basePath: Path | None = None) -> 
 
 
 def validateRunConfig(config: RunConfig) -> None:
+    if config.simulation.backend not in {"v1", "v2"}:
+        raise ValueError("simulation.backend must be either 'v1' or 'v2'")
     if config.objectiveVersion == "v1":
         if config.loss is None:
             config.loss = LossConfig()
@@ -383,6 +403,8 @@ def validateRunConfig(config: RunConfig) -> None:
 
 
 def validatePPORunConfig(config: PPORunConfig) -> None:
+    if config.simulation.backend not in {"v1", "v2"}:
+        raise ValueError("simulation.backend must be either 'v1' or 'v2'")
     if config.objectiveVersion == "v1":
         if config.loss is None:
             config.loss = LossConfig()
@@ -699,6 +721,7 @@ def runConfigToDict(config: RunConfig) -> dict[str, Any]:
         "experiment": asdict(config.experiment),
         "device": asdict(config.device),
         "array": asdict(config.array),
+        "simulation": asdict(config.simulation),
         "objectiveVersion": config.objectiveVersion,
         "evolution": {
             key: value for key, value in asdict(config.evolution).items() if key != "generator"
@@ -721,6 +744,7 @@ def ppoRunConfigToDict(config: PPORunConfig) -> dict[str, Any]:
         "experiment": asdict(config.experiment),
         "device": asdict(config.device),
         "array": asdict(config.array),
+        "simulation": asdict(config.simulation),
         "objectiveVersion": config.objectiveVersion,
         "modelConfig": config.modelConfig,
         "model": modelConfigToDict(config.model),

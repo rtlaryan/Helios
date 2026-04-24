@@ -15,6 +15,10 @@ experiment:
 # Objective selector.
 objectiveVersion: v1 # Use the original objective implementation in train/objective.py.
 
+# Simulator backend selector.
+simulation:
+  backend: v1 # v1 uses the chunked PyTorch simulator; v2 uses the Triton shared-grid simulator.
+
 # Device and numeric precision.
 device:
   device: cuda # Torch device to run training on, e.g. cpu or cuda.
@@ -27,14 +31,14 @@ array:
   positionJitterSTD: 0.0 # Standard deviation of per-element position jitter in meters.
   phaseJitterSTD: 0.0 # Standard deviation of phase jitter in radians during initialization/mutation.
   failRate: 0.0 # Probability that an element is disabled in the sampled array mask.
-  allowedElementCount: [10000] # Allowed element counts to sample from when generating candidate arrays.
+  allowedElementCount: [25000] # Allowed element counts to sample from when generating candidate arrays.
   allowedAspectRatio: [1.0] # Allowed array aspect ratios to sample from.
   geometry: URA # Array geometry family, e.g. URA or UCA.
   gainRange: [1.0, 1.0] # Min/max platform gain sampled per array.
   sparsityRange: [1.0, 1.0] # Min/max active-element fraction sampled per array.
   latitudeRange: [15.0, 15.0] # Min/max array platform latitude in degrees.
   longitudeRange: [-83.0, -83.0] # Min/max array platform longitude in degrees.
-  altitudeRange: [5.5e6, 5.5e6] # Min/max array platform altitude in meters.
+  altitudeRange: [6e6, 6e6] # Min/max array platform altitude in meters.
 
 # Evolutionary optimizer settings.
 evolution:
@@ -67,8 +71,8 @@ evolution:
   amplitudeMinSigmaScale: 0.1 # Scale factor for adaptive amplitude sigma floor.
   wideGridSizeStart: 128 # Initial wide-angle grid size before ramping to the final v1 wide grid size.
   wideGridRampSteps: 4000 # Number of steps used to ramp the v1 wide grid size to its final value.
-  linearResponseChunkSize: 1000000000 # Chunk cap for target-grid response evaluation.
-  wideResponseChunkSize: 1000000000 # Chunk cap for wide-grid response evaluation.
+  linearResponseChunkSize: 500000000 # Chunk cap for target-grid response evaluation.
+  wideResponseChunkSize: 500000000 # Chunk cap for wide-grid response evaluation.
 
 # Objective v1 weighting / fidelity settings.
 loss:
@@ -98,7 +102,7 @@ workers:
 
 # Target source configuration. Exactly one of reference, references, manifest, inline, or inlineBatch should be active.
 target:
-  reference: data/targets/manual/target_spec.pt # Shared target file path used when targetMode is shared.
+  reference: data/targets/manual/target_spec_single.pt # Shared target file path used when targetMode is shared.
   references: null # Optional explicit list of per-sample target paths.
   manifest: null # Optional manifest YAML containing target record paths.
   inline: null # Optional inline shared target payload serialized directly in YAML.
@@ -111,6 +115,6 @@ target:
   decimate: 6 # Spatial decimation factor applied after target load.
   loadingMode: block_window # Corpus loading strategy. Shared-target runs typically ignore this.
   blockSize: 4096 # Number of manifest targets per loader block when block loading is used.
-  prefetchNextBlock: true # Whether the next target block is prefetched in the background.
+  prefetchNextBlock: false # Whether the next target block is prefetched in the background.
   loaderWorkers: auto # Number of loader workers, or auto to derive a count from CPU availability.
   shuffleEachEpoch: true # Whether manifest-backed target order is reshuffled each epoch.

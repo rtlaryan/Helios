@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from scripts.arrayBatch import ArrayBatch
 from scripts.coordinateTransforms import LLAtoECEF, getECEFtoENUMapping, mapLLAtoArrayAZEL
 from scripts.targetSpec import TargetBatch, TargetLike, TargetSpec
-from simulation.arraySim import arrayResponseBatch, arrayResponseBatchSharedGrid
+from simulation.response import SimulationBackend, responseBatch, responseBatchSharedGrid
 
 TargetMode = Literal["auto", "shared", "per_sample"]
 
@@ -18,10 +18,11 @@ TargetMode = Literal["auto", "shared", "per_sample"]
 @dataclass
 class LossConfigV2:
     w_shape: float = 1.0
-    w_coverage: float = 2.0
-    w_shell: float = 0.5
-    w_global: float = 4.0
-    w_peak: float = 8.0
+    w_efficiency: float = 1.0
+    w_null_penalty: float = 2.0
+    w_shell: float = .25
+    w_global: float = 1.0
+    w_peak: float = 1.0
     importance_cutoff: float = 0.05
     boundary_cells: int = 1
     concern_dilation_cells: int = 1
@@ -48,13 +49,15 @@ class TargetPrepV2:
 class BatchEvaluationV2:
     totalLoss: torch.Tensor
     shapeLoss: torch.Tensor
-    coverageLoss: torch.Tensor
+    efficiencyLoss: torch.Tensor
+    nullPenaltyLoss: torch.Tensor
     shellLoss: torch.Tensor
     globalLoss: torch.Tensor
     peakLoss: torch.Tensor
     linearResponse: torch.Tensor
     targetAZEL: tuple[torch.Tensor, torch.Tensor]
     targetMode: TargetMode
+    diagnostics: dict[str, torch.Tensor] | None = None
     stats: dict[str, float] | None = None
     metadata: dict[str, float | int] | None = None
 
@@ -74,8 +77,13 @@ class _CoarseFrontSharedCache:
     elevationGrid: torch.Tensor
     steering: torch.Tensor
     omegaGrid: torch.Tensor
+    serviceMask: torch.Tensor
     concernMask: torch.Tensor
+    qFrontService: torch.Tensor
+    qFrontTotal: torch.Tensor
     qFrontOutside: torch.Tensor
+    serviceWeightSum: torch.Tensor
+    frontWeightSum: torch.Tensor
     outsideWeightSum: torch.Tensor
     angleStep: float
     hpbw: float
@@ -284,6 +292,12 @@ def _sharedTargetAZELForHomogeneousBatch(
 
 
 def _batchGeometryCacheKey(batch: ArrayBatch) -> tuple[int | float | str, ...]:
+    if batch.geometryCacheKey is not None:
+        return (
+            *batch.geometryCacheKey,
+            str(batch.device),
+            hash(batch.dtype),
+        )
     return (
         batch.elementLocalPosition.data_ptr(),
         batch.elementLocalPosition._version,
@@ -422,6 +436,30 @@ def _maskedWeightedMean(
     return numerator / denominator
 
 
+def _maskedMin(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    maskedValues = values.masked_fill(~mask, float("inf"))
+    mins = maskedValues.min(dim=1).values
+    valid = mask.any(dim=1)
+    return torch.where(valid, mins, torch.zeros_like(mins))
+
+
+def _maskedQuantile(values: torch.Tensor, mask: torch.Tensor, quantile: float) -> torch.Tensor:
+    rows: list[torch.Tensor] = []
+    for idx in range(values.shape[0]):
+        selected = values[idx][mask[idx]]
+        if selected.numel() == 0:
+            rows.append(values.new_zeros(()))
+        else:
+            rows.append(torch.quantile(selected, quantile))
+    return torch.stack(rows)
+
+
+def _maskedFraction(maskedPredicate: torch.Tensor, mask: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
+    numerator = (maskedPredicate.to(dtype=torch.float32) * mask.to(dtype=torch.float32)).sum(dim=1)
+    denominator = mask.to(dtype=torch.float32).sum(dim=1).clamp_min(eps)
+    return numerator / denominator
+
+
 def _topKMaskedMean(values: torch.Tensor, mask: torch.Tensor, topk: int) -> torch.Tensor:
     flatValues = values.flatten(1)
     flatMask = mask.flatten(1)
@@ -447,7 +485,6 @@ def _buildFineSharedCache(
     steering = _steeringMatrix(batch.elementLocalPosition[0], batch.wavelength, azimuth, elevation)
     frontMask = _frontMaskFromAZEL(azimuth, elevation).to(dtype=batch.dtype)
     omega = torch.cos(elevation).clamp_min(0.0)
-    serviceWeights = omega * prep.serviceMaskFlat[0].to(dtype=batch.dtype) * frontMask
     shellWeights = omega * prep.shellMaskFlat[0].to(dtype=batch.dtype) * frontMask
     cached = _FineSharedCache(
         azimuth=azimuth,
@@ -472,6 +509,7 @@ def _buildCoarseSharedCache(
 ) -> _CoarseFrontSharedCache:
     cacheKey = (
         _batchGeometryCacheKey(batch),
+        prep.serviceMaskFlat.data_ptr(),
         prep.concernMaskFlat.data_ptr(),
         azimuthGrid.shape[0],
         elevationGrid.shape[1],
@@ -493,15 +531,29 @@ def _buildCoarseSharedCache(
         elevationGrid=elevationGrid,
         dilationCells=params.concern_dilation_cells,
     )[0]
+    serviceMask = _rasterizeProjectedMask(
+        targetAZEL=(targetAZEL[0][:1], targetAZEL[1][:1]),
+        flatMask=prep.serviceMaskFlat[:1],
+        azimuthGrid=azimuthGrid,
+        elevationGrid=elevationGrid,
+        dilationCells=0,
+    )[0]
     omegaGrid = torch.cos(elevationGrid).clamp_min(0.0)
+    frontWeights = omegaGrid.reshape(-1)
+    serviceWeights = (omegaGrid * serviceMask.to(dtype=batch.dtype)).reshape(-1)
     outsideWeights = (omegaGrid * (~concernMask).to(dtype=batch.dtype)).reshape(-1)
     cached = _CoarseFrontSharedCache(
         azimuthGrid=azimuthGrid,
         elevationGrid=elevationGrid,
         steering=steering,
         omegaGrid=omegaGrid,
+        serviceMask=serviceMask,
         concernMask=concernMask,
+        qFrontService=_buildOperator(steering, serviceWeights),
+        qFrontTotal=_buildOperator(steering, frontWeights),
         qFrontOutside=_buildOperator(steering, outsideWeights),
+        serviceWeightSum=serviceWeights.sum().clamp_min(torch.finfo(batch.dtype).eps),
+        frontWeightSum=frontWeights.sum().clamp_min(torch.finfo(batch.dtype).eps),
         outsideWeightSum=outsideWeights.sum().clamp_min(torch.finfo(batch.dtype).eps),
         angleStep=angleStep,
         hpbw=hpbw,
@@ -520,6 +572,7 @@ def evaluateBatchV2(
     wideResponseChunkSize: int | None = None,
     allowSharedTargetFastPath: bool = True,
     collectStats: bool = False,
+    simulationBackend: SimulationBackend = "v1",
 ) -> BatchEvaluationV2:
     startedAt = time.perf_counter()
     resolvedMode = _resolveTargetMode(target, targetMode)
@@ -548,9 +601,10 @@ def evaluateBatchV2(
         linearResponse = linearResponseFlat.reshape(batch.batchSize, *prep.targetShape)
     else:
         targetAZEL = mapLLAtoArrayAZEL(batch, prep.targetCoordinates)
-        linearResponse = arrayResponseBatch(
+        linearResponse = responseBatch(
             batch=batch,
             relativeTargetAZEL=targetAZEL,
+            backend=simulationBackend,
             chunkSize=linearResponseChunkSize,
         ).reshape(batch.batchSize, *prep.targetShape)
     fineSeconds = time.perf_counter() - fineStarted
@@ -558,9 +612,10 @@ def evaluateBatchV2(
     azSize, elSize, angleStep, hpbw = _estimateFrontGridShape(batch, params)
     coarseGridStarted = time.perf_counter()
     frontAZGrid, frontELGrid = _getFrontGrid(batch.device, batch.dtype, azSize, elSize)
-    coarseResponse = arrayResponseBatchSharedGrid(
+    coarseResponse = responseBatchSharedGrid(
         batch=batch,
         relativeTargetAZEL=(frontAZGrid, frontELGrid),
+        backend=simulationBackend,
         chunkSize=wideResponseChunkSize,
     )
     coarseSeconds = time.perf_counter() - coarseGridStarted
@@ -570,6 +625,9 @@ def evaluateBatchV2(
     peakRef = torch.maximum(finePeak, coarsePeak).clamp_min(torch.finfo(batch.dtype).eps)
     responseNormFlat = linearResponse.flatten(1) / peakRef.unsqueeze(1)
     coarseNorm = coarseResponse / peakRef.view(-1, 1, 1)
+    serviceMask = prep.serviceMaskFlat.expand_as(responseNormFlat)
+    serviceResponseNorm = responseNormFlat.masked_fill(~serviceMask, 0.0)
+    servicePeakNorm = serviceResponseNorm.max(dim=1).values
 
     serviceWeights = prep.serviceMaskFlat.to(dtype=batch.dtype) * prep.boundaryWeightFlat
     shapePerPixel = F.smooth_l1_loss(
@@ -579,13 +637,14 @@ def evaluateBatchV2(
     )
     shapeLoss = _maskedWeightedMean(shapePerPixel, serviceWeights)
 
-    coverageShortfall = torch.relu(prep.thresholdLinear.expand_as(responseNormFlat) - responseNormFlat)
-    coverageLoss = _maskedWeightedMean(coverageShortfall.square(), prep.serviceMaskFlat.to(dtype=batch.dtype))
+    nullShortfall = torch.relu(prep.thresholdLinear.expand_as(responseNormFlat) - responseNormFlat)
+    nullPenaltyLoss = _maskedWeightedMean(
+        nullShortfall.square(), prep.serviceMaskFlat.to(dtype=batch.dtype)
+    )
 
     if useSharedFastPath:
         operatorStarted = time.perf_counter()
         shellEnergy = _quadraticForm(batch.weights, fineCache.qShell)
-        shellLoss = shellEnergy / peakRef / fineCache.shellWeightSum
         coarseCache = _buildCoarseSharedCache(
             batch=batch,
             prep=prep,
@@ -597,13 +656,25 @@ def evaluateBatchV2(
             hpbw=hpbw,
         )
         fineOperatorBuildSeconds += time.perf_counter() - operatorStarted
+        serviceEnergy = _quadraticForm(batch.weights, coarseCache.qFrontService)
+        frontEnergy = _quadraticForm(batch.weights, coarseCache.qFrontTotal)
+        efficiencyLoss = 1.0 - serviceEnergy / frontEnergy.clamp_min(torch.finfo(batch.dtype).eps)
+        shellLoss = shellEnergy / peakRef / fineCache.shellWeightSum
         globalEnergy = _quadraticForm(batch.weights, coarseCache.qFrontOutside)
         globalLoss = globalEnergy / peakRef / coarseCache.outsideWeightSum
+        projectedServiceMask = coarseCache.serviceMask.unsqueeze(0).expand(batch.batchSize, -1, -1)
         projectedConcernMask = coarseCache.concernMask.unsqueeze(0).expand(batch.batchSize, -1, -1)
     else:
         localOmega = torch.cos(targetAZEL[1]).clamp_min(0.0)
         localShellWeights = localOmega * prep.shellMaskFlat.to(dtype=batch.dtype)
         shellLoss = _maskedWeightedMean(responseNormFlat, localShellWeights)
+        projectedServiceMask = _rasterizeProjectedMask(
+            targetAZEL=targetAZEL,
+            flatMask=prep.serviceMaskFlat,
+            azimuthGrid=frontAZGrid,
+            elevationGrid=frontELGrid,
+            dilationCells=0,
+        )
         projectedConcernMask = _rasterizeProjectedMask(
             targetAZEL=targetAZEL,
             flatMask=prep.concernMaskFlat,
@@ -612,15 +683,36 @@ def evaluateBatchV2(
             dilationCells=params.concern_dilation_cells,
         )
         coarseOmega = torch.cos(frontELGrid).clamp_min(0.0).unsqueeze(0).expand(batch.batchSize, -1, -1)
+        serviceEnergy = (coarseResponse * coarseOmega * projectedServiceMask.to(dtype=batch.dtype)).flatten(1).sum(dim=1)
+        frontEnergy = (coarseResponse * coarseOmega).flatten(1).sum(dim=1)
+        efficiencyLoss = 1.0 - serviceEnergy / frontEnergy.clamp_min(torch.finfo(batch.dtype).eps)
         globalWeights = coarseOmega * (~projectedConcernMask).to(dtype=batch.dtype)
         globalLoss = _maskedWeightedMean(coarseNorm.flatten(1), globalWeights.flatten(1))
 
     offTargetMask = ~projectedConcernMask
     peakLoss = _topKMaskedMean(coarseNorm, offTargetMask, params.peak_topk)
+    diagnostics = {
+        "serviceMeanNorm": _maskedWeightedMean(responseNormFlat, serviceMask.to(dtype=batch.dtype)),
+        "serviceP10Norm": _maskedQuantile(responseNormFlat, serviceMask, 0.10),
+        "serviceMinNorm": _maskedMin(responseNormFlat, serviceMask),
+        "serviceCoverageFrac": _maskedFraction(
+            responseNormFlat >= prep.thresholdLinear.expand_as(responseNormFlat),
+            serviceMask,
+        ).to(dtype=batch.dtype),
+        "servicePeakNorm": servicePeakNorm,
+        "serviceEnergyFraction": 1.0 - efficiencyLoss,
+        "shellMeanNorm": shellLoss,
+        "globalMeanNorm": globalLoss,
+        "offTargetPeakMeanNorm": peakLoss,
+        "finePeakNorm": finePeak / peakRef,
+        "coarsePeakNorm": coarsePeak / peakRef,
+        "peakRef": peakRef,
+    }
 
     totalLoss = (
         params.w_shape * shapeLoss
-        + params.w_coverage * coverageLoss
+        + params.w_efficiency * efficiencyLoss
+        + params.w_null_penalty * nullPenaltyLoss
         + params.w_shell * shellLoss
         + params.w_global * globalLoss
         + params.w_peak * peakLoss
@@ -628,7 +720,8 @@ def evaluateBatchV2(
     if logTerms:
         print(
             f"shape={params.w_shape * shapeLoss.mean().item():.4f} | "
-            f"coverage={params.w_coverage * coverageLoss.mean().item():.4f} | "
+            f"efficiency={params.w_efficiency * efficiencyLoss.mean().item():.4f} | "
+            f"nullPenalty={params.w_null_penalty * nullPenaltyLoss.mean().item():.4f} | "
             f"shell={params.w_shell * shellLoss.mean().item():.4f} | "
             f"global={params.w_global * globalLoss.mean().item():.4f} | "
             f"peak={params.w_peak * peakLoss.mean().item():.4f}"
@@ -657,13 +750,15 @@ def evaluateBatchV2(
     return BatchEvaluationV2(
         totalLoss=totalLoss,
         shapeLoss=shapeLoss,
-        coverageLoss=coverageLoss,
+        efficiencyLoss=efficiencyLoss,
+        nullPenaltyLoss=nullPenaltyLoss,
         shellLoss=shellLoss,
         globalLoss=globalLoss,
         peakLoss=peakLoss,
         linearResponse=linearResponse,
         targetAZEL=targetAZEL,
         targetMode=resolvedMode,
+        diagnostics=diagnostics,
         stats=stats,
         metadata=metadata,
     )
@@ -678,6 +773,7 @@ def batchLossV2(
     linearResponseChunkSize: int | None = None,
     wideResponseChunkSize: int | None = None,
     allowSharedTargetFastPath: bool = True,
+    simulationBackend: SimulationBackend = "v1",
 ) -> torch.Tensor:
     return evaluateBatchV2(
         batch=batch,
@@ -688,4 +784,5 @@ def batchLossV2(
         linearResponseChunkSize=linearResponseChunkSize,
         wideResponseChunkSize=wideResponseChunkSize,
         allowSharedTargetFastPath=allowSharedTargetFastPath,
+        simulationBackend=simulationBackend,
     ).totalLoss

@@ -42,7 +42,8 @@ from train.objective import BatchEvaluation, LossConfig, evaluateBatch
 from train.objective_v2 import BatchEvaluationV2, LossConfigV2, evaluateBatchV2
 from train.evaluation_utils import (
     ObjectiveVersion,
-    evaluation_loss_means,
+    evaluation_diagnostic_means,
+    evaluation_weighted_loss_means,
     evaluation_loss_record,
     loss_term_keys_for_objective,
 )
@@ -522,6 +523,14 @@ class PPOController:
             metricKey = f"mean{name[0].upper()}{name[1:]}Loss"
             if metricKey in summary:
                 self.writer.add_scalar(f"Loss/{name[0].upper()}{name[1:]}", summary[metricKey], step)
+        for key, value in summary.items():
+            if key.startswith("mean") and key.endswith("Metric"):
+                diagnosticName = key[len("mean") : -len("Metric")]
+                self.writer.add_scalar(
+                    f"Diagnostics/{diagnosticName[0].lower()}{diagnosticName[1:]}",
+                    value,
+                    step,
+                )
         self.writer.add_scalar("PPO/PolicyLoss", summary["policyLoss"], step)
         self.writer.add_scalar("PPO/ValueLoss", summary["valueLoss"], step)
         self.writer.add_scalar("PPO/Entropy", summary["entropy"], step)
@@ -1137,8 +1146,12 @@ class PPOController:
                     "corpusTargetsSeen": float(corpusStatus["targetsSeen"]),
                     "corpusBlockLoadSeconds": float(corpusStatus["blockLoadSeconds"]),
                 }
-                for name, value in evaluation_loss_means(rollout.evaluation).items():
+                for name, value in evaluation_weighted_loss_means(
+                    rollout.evaluation, self.lossParams
+                ).items():
                     summary[f"mean{name[0].upper()}{name[1:]}Loss"] = value
+                for name, value in evaluation_diagnostic_means(rollout.evaluation).items():
+                    summary[f"mean{name[0].upper()}{name[1:]}Metric"] = value
                 self._logMetrics(step, summary)
                 prefetchLabel = (
                     "ready"

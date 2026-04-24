@@ -5,7 +5,7 @@
 
 # Experiment-level runtime settings.
 experiment:
-  name: evo_v2_reference # Experiment name used for run/archive output folders.
+  name: evo_v3_multi_triton # Experiment name used for run/archive output folders.
   logDir: data/runs/evolution # TensorBoard and run metadata root directory.
   archiveDir: data/archive/evolution # Checkpoint / dataset / summary output root directory.
   resume: false # Whether to resume from an existing checkpoint if present.
@@ -15,6 +15,10 @@ experiment:
 
 # Objective selector.
 objectiveVersion: v2 # Use the standalone regional objective v2. Valid values: v1 or v2.
+
+# Simulator backend selector.
+simulation:
+  backend: v2 # v1 uses the chunked PyTorch simulator; v2 uses the Triton shared-grid simulator.
 
 # Device and numeric precision.
 device:
@@ -28,59 +32,60 @@ array:
   positionJitterSTD: 0.0 # Standard deviation of per-element position jitter in meters.
   phaseJitterSTD: 0.0 # Standard deviation of phase jitter in radians during initialization/mutation.
   failRate: 0.0 # Probability that an element is disabled in the sampled array mask.
-  allowedElementCount: [10000] # Allowed element counts to sample from when generating candidate arrays.
+  allowedElementCount: [5000] # Allowed element counts to sample from when generating candidate arrays.
   allowedAspectRatio: [1.0] # Allowed array aspect ratios to sample from.
-  geometry: URA # Array geometry family, e.g. URA or UCA.
+  geometry: UCA # Array geometry family, e.g. URA or UCA.
   gainRange: [1.0, 1.0] # Min/max platform gain sampled per array.
   sparsityRange: [1.0, 1.0] # Min/max active-element fraction sampled per array.
   latitudeRange: [15.0, 15.0] # Min/max array platform latitude in degrees.
   longitudeRange: [-83.0, -83.0] # Min/max array platform longitude in degrees.
-  altitudeRange: [5.5e6, 5.5e6] # Min/max array platform altitude in meters.
+  altitudeRange: [6e6, 6e6] # Min/max array platform altitude in meters.
 
 # Evolutionary optimizer settings.
 evolution:
   generator: null # Optional explicit torch.Generator seed/state source. Usually left null.
-  batchSize: 40 # Population size evaluated each evolution step.
-  evolutionSteps: 20000 # Number of evolution iterations to run.
-  initialWeightsType: random # Initial weight sampler: random, uniform, or directed.
+  batchSize: 50 # Population size evaluated each evolution step.
+  evolutionSteps: 120000 # Number of evolution iterations to run.
+  initialWeightsType: directed # Initial weight sampler: random, uniform, or directed.
   cloneFraction: 0.15 # Fraction of top-ranked samples copied unchanged to the next population.
   crossoverFraction: 0.15 # Fraction of next population created via parent crossover.
   mutateFraction: 0.55 # Fraction of next population created via mutation.
   randomFraction: 0.15 # Fraction of next population injected as fresh random samples.
   parentPoolFraction: 0.15 # Fraction of best-ranked population eligible for reproduction.
-  phaseSigma: 0.2 # Initial mutation noise scale for phase perturbations.
+  phaseSigma: 0.15 # Initial mutation noise scale for phase perturbations.
   amplitudeSigma: 0.01 # Initial mutation noise scale for amplitude perturbations.
   gainSigma: 0.0 # Reserved gain mutation scale. Currently kept for compatibility.
-  phaseSigmaDecay: 0.9998 # Per-step decay applied to phase mutation sigma.
+  phaseSigmaDecay: 0.9995 # Per-step decay applied to phase mutation sigma.
   amplitudeSigmaDecay: 0.9995 # Per-step decay applied to amplitude mutation sigma.
-  randomFractionDecay: 0.999 # Per-step decay applied to random injection fraction.
-  phaseMinSigma: 5e-4 # Hard lower bound for phase mutation sigma.
+  randomFractionDecay: 0.99 # Per-step decay applied to random injection fraction.
+  phaseMinSigma: 1e-4 # Hard lower bound for phase mutation sigma.
   amplitudeMinSigma: 5e-5 # Hard lower bound for amplitude mutation sigma.
   minRandomFraction: 0.02 # Minimum random injection fraction after decay.
   stagnationWindow: 250 # Number of non-improving steps before exploration boost triggers.
   sigmaBoostDuration: 25 # Number of steps exploration boost stays active.
   sigmaBoostMultiplier: 2.0 # Multiplier applied to sigmas during exploration boost.
   sigmaBoostRandomFraction: 0.15 # Minimum random fraction enforced during boost windows.
-  phaseAdaptiveSigmaFloor: false # Whether the phase sigma floor adapts to parent diversity.
+  phaseAdaptiveSigmaFloor: true # Whether the phase sigma floor adapts to parent diversity.
   amplitudeAdaptiveSigmaFloor: true # Whether the amplitude sigma floor adapts to parent diversity.
   phaseMinSigmaScale: 0.1 # Scale factor for adaptive phase sigma floor.
   amplitudeMinSigmaScale: 0.1 # Scale factor for adaptive amplitude sigma floor.
-  linearResponseChunkSize: 1000000000 # Chunk cap for target-grid response evaluation.
-  wideResponseChunkSize: 1000000000 # Chunk cap for wide-grid/front-grid response evaluation.
+  linearResponseChunkSize: 100000000 # Chunk cap for target-grid response evaluation.
+  wideResponseChunkSize: 100000000 # Chunk cap for wide-grid/front-grid response evaluation.
 
 # Objective v2 weighting / fidelity settings.
 lossV2:
   w_shape: 1.0 # Weight on pointwise service-area shape matching.
-  w_coverage: 2.0 # Weight on under-illumination penalty inside the service region.
+  w_efficiency: 1.0 # Weight on directing more integrated energy into the service region.
+  w_null_penalty: 2.0 # Weight on penalizing under-illuminated service-area cells / nulls.
   w_shell: 0.5 # Weight on spill inside the importance shell outside the service mask.
-  w_global: 4.0 # Weight on front-hemisphere spill outside the projected concern region.
-  w_peak: 8.0 # Weight on top-k worst off-target front-hemisphere sidelobes.
+  w_global: 1.0 # Weight on front-hemisphere spill outside the projected concern region.
+  w_peak: 1.0 # Weight on top-k worst off-target front-hemisphere sidelobes.
   importance_cutoff: 0.05 # Threshold applied to importanceMap when forming the concern shell.
   boundary_cells: 1 # Erosion radius in target-map cells used to define the service boundary boost.
   concern_dilation_cells: 1 # Dilation radius in front-grid cells used when rasterizing the concern mask.
   peak_topk: 8 # Number of strongest off-target front-grid samples averaged into peakLoss.
   samples_per_hpbw: 4.0 # Front-grid sampling density measured in samples per estimated HPBW.
-  min_front_grid_size: 32 # Lower clamp on front-hemisphere grid size per angular axis.
+  min_front_grid_size: 128 # Lower clamp on front-hemisphere grid size per angular axis.
   max_front_grid_size: 128 # Upper clamp on front-hemisphere grid size per angular axis.
 
 # Metrics / dataset logging settings.
@@ -116,6 +121,6 @@ target:
   decimate: 6 # Spatial decimation factor applied after target load.
   loadingMode: block_window # Corpus loading strategy. Shared-target runs typically ignore this.
   blockSize: 4096 # Number of manifest targets per loader block when block loading is used.
-  prefetchNextBlock: true # Whether the next target block is prefetched in the background.
+  prefetchNextBlock: false # Whether the next target block is prefetched in the background.
   loaderWorkers: auto # Number of loader workers, or auto to derive a count from CPU availability.
   shuffleEachEpoch: true # Whether manifest-backed target order is reshuffled each epoch.

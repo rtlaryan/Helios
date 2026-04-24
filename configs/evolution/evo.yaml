@@ -8,6 +8,10 @@ experiment:
   tensorboard: true # Whether TensorBoard logging is enabled.
   targetMode: shared # How targets are interpreted: shared target or per-sample target batch.
 
+# Simulator backend selector.
+simulation:
+  backend: v1 # v1 uses the chunked PyTorch simulator; v2 uses the Triton shared-grid simulator.
+
 # Device and numeric precision.
 device:
   device: cuda # Torch device to run training on.
@@ -20,14 +24,14 @@ array:
   positionJitterSTD: 0.0 # Standard deviation of element position jitter in meters.
   phaseJitterSTD: 0.0 # Standard deviation of initialization phase jitter in radians.
   failRate: 0.0 # Probability that an element is disabled in the sampled array mask.
-  allowedElementCount: [10000] # Allowed element counts to sample from.
+  allowedElementCount: [25000] # Allowed element counts to sample from.
   allowedAspectRatio: [1.0] # Allowed array aspect ratios to sample from.
   geometry: URA # Array geometry family, e.g. URA or UCA.
   gainRange: [1.0, 1.0] # Min/max platform gain sampled per array.
   sparsityRange: [1.0, 1.0] # Min/max active-element fraction sampled per array.
   latitudeRange: [15.0, 15.0] # Min/max array platform latitude in degrees.
   longitudeRange: [-83.0, -83.0] # Min/max array platform longitude in degrees.
-  altitudeRange: [5.5e6, 5.5e6] # Min/max array platform altitude in meters.
+  altitudeRange: [6e6, 6e6] # Min/max array platform altitude in meters.
 
 # Evolutionary optimizer settings.
 evolution:

@@ -100,11 +100,14 @@ def test_load_run_config_with_inline_target_accepts_deprecated_loss_keys(tmp_pat
     runConfig = loadRunConfig(configPath)
     resolvedTarget = resolveTarget(runConfig)
     serializedLoss = runConfigToDict(runConfig)["loss"]
+    serialized = runConfigToDict(runConfig)
 
     assert runConfig.sourcePath == configPath
+    assert runConfig.simulation.backend == "v1"
     assert isinstance(resolvedTarget, TargetSpec)
     assert runConfig.loss.wide_support_dilation_cells == 2
     assert "psl_local_mix" not in serializedLoss
+    assert serialized["simulation"]["backend"] == "v1"
 
 
 def test_load_run_config_accepts_directed_initial_weights(tmp_path: Path) -> None:
@@ -197,6 +200,83 @@ def test_load_run_config_rejects_removed_chunk_shape_strategy(tmp_path: Path) ->
 
     with pytest.raises(ValueError, match="responseChunkShapeStrategy has been removed"):
         loadRunConfig(configPath)
+
+
+def test_load_run_config_rejects_invalid_simulation_backend(tmp_path: Path) -> None:
+    payload = {
+        "experiment": {"name": "yaml_bad_sim"},
+        "simulation": {"backend": "bad"},
+        "device": {"device": "cpu", "dtype": "float32"},
+        "array": {"allowedElementCount": [4], "allowedAspectRatio": [1.0]},
+        "evolution": {"batchSize": 2, "evolutionSteps": 1},
+        "logging": {"logMode": "metrics_only"},
+        "checkpoint": {"checkpointMode": "off"},
+        "workers": {"asyncIO": False, "datasetWriterWorkers": 0, "checkpointWriterWorkers": 0},
+        "target": {"inline": make_target_inline_payload()},
+    }
+    configPath = tmp_path / "run.yaml"
+    with configPath.open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(payload, handle, sort_keys=False)
+
+    with pytest.raises(ValueError, match="simulation.backend"):
+        loadRunConfig(configPath)
+
+
+def test_evo_v2_reference_uses_simulation_backend_v2() -> None:
+    runConfig = loadRunConfig("configs/evolution/evo_v2_reference.yaml")
+
+    assert runConfig.objectiveVersion == "v2"
+    assert runConfig.simulation.backend == "v2"
+
+
+def test_v1_objective_simulation_backend_v2_fails_fast_on_cpu() -> None:
+    target = make_target()
+    batch = generateBatch(
+        make_array_spec(),
+        batchSize=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        weightsType="random",
+        targetLLA=target.hotspotCoordinates[0],
+    )
+
+    with pytest.raises(RuntimeError, match="requires a CUDA ArrayBatch"):
+        evaluateBatch(
+            batch,
+            target,
+            LossConfig(wide_grid_size=4),
+            targetMode="shared",
+            simulationBackend="v2",
+        )
+
+
+def test_evolution_step_with_simulation_backend_v2_on_cuda_when_available() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for simulation backend v2")
+
+    controller = EvolutionController(
+        config=EvolutionConfig(
+            batchSize=2,
+            evolutionSteps=2,
+            cloneFraction=0.5,
+            crossoverFraction=0.0,
+            mutateFraction=0.5,
+            randomFraction=0.0,
+            parentPoolFraction=1.0,
+            generator=torch.Generator(device="cuda").manual_seed(0),
+        ),
+        targetSpec=make_target(),
+        arraySpec=make_array_spec(),
+        lossParams=LossConfig(wide_grid_size=4),
+        simulationBackend="v2",
+    )
+    batch = controller.initEvolution(dtype=torch.float32, device=torch.device("cuda"))
+    population = controller._populationForStep(batch, 0)
+
+    nextPopulation = controller.evolutionStep(0, population, controller._initialSchedulerState())
+
+    assert nextPopulation.batch.batchSize == 2
+    assert torch.isfinite(nextPopulation.evaluation.totalLoss).all()
 
 
 def test_infer_target_center_prefers_weighted_support_centroid() -> None:

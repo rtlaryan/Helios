@@ -229,7 +229,8 @@ For a run named `evo_yaml_demo`:
 - final summary: `data/archive/evo_yaml_demo/final.pt`
 
 If you resume an experiment and `runs/<experiment>/config.yaml` already exists, the trainer validates that the active config matches it before continuing.
-When `resume: true`, it allows updates to scheduler-oriented evolution fields such as `phaseSigma`, `amplitudeSigma`, their decays and floors, stagnation/boost knobs, fidelity-ramp knobs, and `initialWeightsType`, while still rejecting structural changes like batch fractions.
+When `resume: true`, it allows updates to `evolutionSteps`, scheduler-oriented evolution fields such as `phaseSigma`, `amplitudeSigma`, their decays and floors, stagnation/boost knobs, fidelity-ramp knobs, and `initialWeightsType`, while still rejecting structural changes like batch fractions.
+When `resume: false`, the CLI now pauses with a confirmation prompt before deleting any existing non-empty run/archive data for that experiment. Press Enter to continue or `Ctrl-C` to cancel.
 
 ## Notebook / Programmatic Usage
 

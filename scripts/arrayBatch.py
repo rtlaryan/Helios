@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import hashlib
 
 import torch
 
@@ -14,6 +15,52 @@ def _normalize_amplitudes(
     return amplitude / norm
 
 
+def _rows_are_identical(tensor: torch.Tensor) -> bool:
+    if tensor.shape[0] <= 1:
+        return True
+    return bool(torch.equal(tensor, tensor[:1].expand_as(tensor)))
+
+
+def _stable_tensor_digest(tensor: torch.Tensor) -> str:
+    cpuTensor = tensor.detach().cpu().contiguous()
+    return hashlib.blake2b(cpuTensor.numpy().tobytes(), digest_size=16).hexdigest()
+
+
+def infer_geometry_cache_key(
+    elementLocalPosition: torch.Tensor,
+    LLAPosition: torch.Tensor,
+    ECEFPosition: torch.Tensor,
+    gain: torch.Tensor,
+    wavelength: float,
+    elementMask: torch.Tensor | None = None,
+) -> tuple[int | float | str, ...] | None:
+    if not (
+        _rows_are_identical(elementLocalPosition)
+        and _rows_are_identical(LLAPosition)
+        and _rows_are_identical(ECEFPosition)
+        and _rows_are_identical(gain)
+        and (elementMask is None or _rows_are_identical(elementMask))
+    ):
+        return None
+
+    key: list[int | float | str] = [
+        "geometry_v1",
+        tuple(elementLocalPosition.shape[1:]),
+        str(elementLocalPosition.dtype),
+        str(LLAPosition.dtype),
+        float(wavelength),
+        _stable_tensor_digest(elementLocalPosition[:1]),
+        _stable_tensor_digest(LLAPosition[:1]),
+        _stable_tensor_digest(ECEFPosition[:1]),
+        _stable_tensor_digest(gain[:1]),
+    ]
+    if elementMask is None:
+        key.append("mask:none")
+    else:
+        key.append(_stable_tensor_digest(elementMask[:1].to(dtype=torch.uint8)))
+    return tuple(key)
+
+
 @dataclass
 class ArrayBatch:
     elementLocalPosition: torch.Tensor  # [B, 3, N] (Real)
@@ -23,6 +70,7 @@ class ArrayBatch:
     LLAPosition: torch.Tensor  # [B, 3] = [latitude degrees, longitude degrees, altitude meters]
     ECEFPosition: torch.Tensor  # [B, 3] = [X, Y, Z] meters
     elementMask: torch.Tensor | None = None  # [B, N] bool (if failRate != 0 or sparsity is desired)
+    geometryCacheKey: tuple[int | float | str, ...] | None = None
 
     @property
     def N(self) -> int:
@@ -74,6 +122,7 @@ class ArrayBatch:
             LLAPosition=self.LLAPosition[i],
             ECEFPosition=self.ECEFPosition[i],
             elementMask=elementMask,
+            geometryCacheKey=self.geometryCacheKey,
         )
 
     def mutateWeights(
@@ -102,6 +151,7 @@ class ArrayBatch:
             LLAPosition=self.LLAPosition,
             ECEFPosition=self.ECEFPosition,
             elementMask=self.elementMask,
+            geometryCacheKey=self.geometryCacheKey,
         )
 
     def crossoverWeights(
@@ -131,6 +181,11 @@ class ArrayBatch:
             LLAPosition=self.LLAPosition,
             ECEFPosition=self.ECEFPosition,
             elementMask=self.elementMask,
+            geometryCacheKey=(
+                self.geometryCacheKey
+                if self.geometryCacheKey == partner.geometryCacheKey
+                else None
+            ),
         )
 
     def serializeBatch(self) -> dict:
@@ -142,6 +197,7 @@ class ArrayBatch:
             "LLAPosition": self.LLAPosition.detach().cpu(),
             "ECEFPosition": self.ECEFPosition.detach().cpu(),
             "elementMask": None if self.elementMask is None else self.elementMask.detach().cpu(),
+            "geometryCacheKey": self.geometryCacheKey,
         }
 
     def serializeBatchSample(self, idx: int) -> dict:
@@ -155,6 +211,7 @@ class ArrayBatch:
             "elementMask": None
             if self.elementMask is None
             else self.elementMask[idx].detach().cpu(),
+            "geometryCacheKey": self.geometryCacheKey,
         }
 
     @classmethod
@@ -167,6 +224,7 @@ class ArrayBatch:
             LLAPosition=payload["LLAPosition"],
             ECEFPosition=payload["ECEFPosition"],
             elementMask=payload["elementMask"],
+            geometryCacheKey=payload.get("geometryCacheKey"),
         )
 
 
@@ -189,6 +247,10 @@ def merge(batches: list[ArrayBatch]) -> "ArrayBatch":
     else:
         elementMasks = concatenateTensors("elementMask")
 
+    geometryCacheKey = referenceBatch.geometryCacheKey
+    if geometryCacheKey is None or any(batch.geometryCacheKey != geometryCacheKey for batch in batches[1:]):
+        geometryCacheKey = None
+
     return ArrayBatch(
         elementLocalPosition=concatenateTensors("elementLocalPosition"),
         weights=concatenateTensors("weights"),
@@ -197,4 +259,5 @@ def merge(batches: list[ArrayBatch]) -> "ArrayBatch":
         LLAPosition=concatenateTensors("LLAPosition"),
         ECEFPosition=concatenateTensors("ECEFPosition"),
         elementMask=elementMasks,
+        geometryCacheKey=geometryCacheKey,
     )

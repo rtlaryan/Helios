@@ -3,7 +3,7 @@ import math
 
 import torch
 
-from .arrayBatch import ArrayBatch, _normalize_amplitudes
+from .arrayBatch import ArrayBatch, _normalize_amplitudes, infer_geometry_cache_key
 from .arraySpec import ArraySpec
 from .coordinateTransforms import LLAtoECEF, getECEFtoENUMapping
 
@@ -325,4 +325,12 @@ def generateBatch(
         LLAPosition=LLAPosition,
         ECEFPosition=ECEFPosition,
         elementMask=elementMask,
+        geometryCacheKey=infer_geometry_cache_key(
+            elementLocalPosition=localPositions,
+            LLAPosition=LLAPosition,
+            ECEFPosition=ECEFPosition,
+            gain=gain,
+            wavelength=spec.wavelength,
+            elementMask=elementMask,
+        ),
     )

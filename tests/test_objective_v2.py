@@ -4,15 +4,26 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
 import yaml
 from scripts.arrayBatch import ArrayBatch
+from scripts.arrayBatch import merge
 from scripts.batchFactory import generateBatch
 from train.config import buildPPORunConfig, buildRunConfig, ppoRunConfigToDict, runConfigToDict
-from train.objective_v2 import LossConfigV2, _prepareTargetV2, evaluateBatchV2
+from train.evaluation_utils import evaluation_diagnostic_means, evaluation_weighted_loss_means
+from train.evolve import EvolutionConfig, EvolutionController, LoggingConfig, CheckpointConfig, WorkerConfig
+from train.objective_v2 import (
+    LossConfigV2,
+    _COARSE_SHARED_CACHE_V2,
+    _FINE_SHARED_CACHE_V2,
+    _prepareTargetV2,
+    clearCachesV2,
+    evaluateBatchV2,
+)
 
 
 def make_target(power_map: torch.Tensor | None = None) -> Any:
@@ -111,10 +122,70 @@ def test_evaluate_batch_v2_uses_global_peak_reference() -> None:
     scaled_eval = evaluateBatchV2(scaled_batch, target, LossConfigV2(), targetMode="shared")
 
     torch.testing.assert_close(base_eval.shapeLoss, scaled_eval.shapeLoss, atol=1e-5, rtol=1e-4)
-    torch.testing.assert_close(base_eval.coverageLoss, scaled_eval.coverageLoss, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(base_eval.efficiencyLoss, scaled_eval.efficiencyLoss, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(base_eval.nullPenaltyLoss, scaled_eval.nullPenaltyLoss, atol=1e-5, rtol=1e-4)
     torch.testing.assert_close(base_eval.shellLoss, scaled_eval.shellLoss, atol=1e-5, rtol=1e-4)
     torch.testing.assert_close(base_eval.globalLoss, scaled_eval.globalLoss, atol=1e-5, rtol=1e-4)
     torch.testing.assert_close(base_eval.peakLoss, scaled_eval.peakLoss, atol=1e-5, rtol=1e-4)
+
+
+def test_v2_weighted_loss_means_and_diagnostics_are_exposed() -> None:
+    target = make_target()
+    batch = generateBatch(
+        make_array_spec(),
+        batchSize=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        weightsType="random",
+        targetLLA=target.hotspotCoordinates[0],
+    )
+    params = LossConfigV2(
+        w_shape=1.5,
+        w_efficiency=2.0,
+        w_null_penalty=2.5,
+        w_shell=0.75,
+        w_global=3.0,
+        w_peak=4.0,
+    )
+    evaluation = evaluateBatchV2(batch, target, params, targetMode="shared")
+
+    weighted = evaluation_weighted_loss_means(evaluation, params)
+    diagnostics = evaluation_diagnostic_means(evaluation)
+
+    assert weighted["shape"] == pytest.approx(float((evaluation.shapeLoss.mean() * params.w_shape).item()))
+    assert weighted["efficiency"] == pytest.approx(
+        float((evaluation.efficiencyLoss.mean() * params.w_efficiency).item())
+    )
+    assert weighted["nullPenalty"] == pytest.approx(
+        float((evaluation.nullPenaltyLoss.mean() * params.w_null_penalty).item())
+    )
+    assert "serviceMeanNorm" in diagnostics
+    assert "serviceCoverageFrac" in diagnostics
+    assert "serviceEnergyFraction" in diagnostics
+    assert "finePeakNorm" in diagnostics
+    assert 0.0 <= diagnostics["serviceCoverageFrac"] <= 1.0
+    assert 0.0 <= diagnostics["serviceEnergyFraction"] <= 1.000001
+
+
+def test_v2_objective_simulation_backend_v2_fails_fast_on_cpu() -> None:
+    target = make_target()
+    batch = generateBatch(
+        make_array_spec(),
+        batchSize=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        weightsType="random",
+        targetLLA=target.hotspotCoordinates[0],
+    )
+
+    with pytest.raises(RuntimeError, match="requires a CUDA ArrayBatch"):
+        evaluateBatchV2(
+            batch,
+            target,
+            LossConfigV2(min_front_grid_size=4, max_front_grid_size=4),
+            targetMode="shared",
+            simulationBackend="v2",
+        )
 
 
 def test_build_run_config_v2_requires_loss_v2_and_serializes_only_active_block() -> None:
@@ -213,3 +284,136 @@ def test_compare_objectives_writes_benchmark_report(tmp_path: Path) -> None:
     assert payload["warm"]["v2_over_v1_ratio"] >= 0.0
     assert "spearman" in payload["ranking"]
     assert "cold" in payload and "warm" in payload
+
+
+def test_compare_objectives_build_fixture_batch_uses_seeded_global_rng_without_generator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import train.compare_objectives as compare_module
+
+    config = SimpleNamespace(
+        array=make_array_spec(),
+        evolution=SimpleNamespace(batchSize=2, initialWeightsType="random"),
+    )
+    generatorArgs: list[torch.Generator | None] = []
+
+    def fake_generate_batch(**kwargs):
+        generatorArgs.append(kwargs.get("generator"))
+        return float(torch.rand(1).item())
+
+    baselineState = torch.random.get_rng_state()
+    monkeypatch.setattr(compare_module, "generateBatch", fake_generate_batch)
+
+    first = compare_module._build_fixture_batch(
+        make_target(),
+        config,
+        device=torch.device("cuda"),
+        dtype=torch.float32,
+    )
+    afterFirstState = torch.random.get_rng_state()
+    second = compare_module._build_fixture_batch(
+        make_target(),
+        config,
+        device=torch.device("cuda"),
+        dtype=torch.float32,
+    )
+
+    assert generatorArgs == [None, None]
+    assert first == second
+    assert torch.equal(baselineState, afterFirstState)
+    assert torch.equal(baselineState, torch.random.get_rng_state())
+
+
+def test_v2_evolution_step_does_not_call_wide_grid_schedule_for_clones(tmp_path: Path) -> None:
+    target = make_target()
+    array_spec = make_array_spec()
+    batch = generateBatch(
+        array_spec,
+        batchSize=4,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        weightsType="random",
+        targetLLA=target.hotspotCoordinates[0],
+    )
+    controller = EvolutionController(
+        config=EvolutionConfig(
+            batchSize=4,
+            evolutionSteps=2,
+            cloneFraction=0.5,
+            crossoverFraction=0.0,
+            mutateFraction=0.5,
+            randomFraction=0.0,
+            parentPoolFraction=0.5,
+        ),
+        targetSpec=target,
+        arraySpec=array_spec,
+        lossParams=LossConfigV2(),
+        objectiveVersion="v2",
+        experimentName="v2_clone_step",
+        archiveRoot=tmp_path / "archive",
+        loggingConfig=LoggingConfig(logMode="off"),
+        checkpointConfig=CheckpointConfig(checkpointMode="off"),
+        workerConfig=WorkerConfig(
+            asyncIO=False,
+            datasetWriterWorkers=0,
+            checkpointWriterWorkers=0,
+            ioQueueSize=1,
+        ),
+        writerLogDir=tmp_path / "runs",
+    )
+
+    evaluation = controller.evaluate(batch)
+    population = controller._populationForStep(batch, 0)
+    scheduler = controller._initialSchedulerState()
+    sorted_ids = torch.argsort(evaluation.totalLoss, dim=0, descending=False)
+
+    next_population = controller.evolutionStep(0, population, scheduler, sortedScoresIDs=sorted_ids)
+
+    assert next_population.batch.batchSize == batch.batchSize
+
+
+def test_v2_shared_operator_caches_reuse_across_merged_batches(tmp_path: Path) -> None:
+    target = make_target()
+    array_spec = make_array_spec()
+    controller = EvolutionController(
+        config=EvolutionConfig(
+            batchSize=4,
+            evolutionSteps=2,
+            cloneFraction=0.5,
+            crossoverFraction=0.0,
+            mutateFraction=0.5,
+            randomFraction=0.0,
+            parentPoolFraction=0.5,
+        ),
+        targetSpec=target,
+        arraySpec=array_spec,
+        lossParams=LossConfigV2(),
+        objectiveVersion="v2",
+        experimentName="v2_cache_reuse",
+        archiveRoot=tmp_path / "archive",
+        loggingConfig=LoggingConfig(logMode="off"),
+        checkpointConfig=CheckpointConfig(checkpointMode="off"),
+        workerConfig=WorkerConfig(
+            asyncIO=False,
+            datasetWriterWorkers=0,
+            checkpointWriterWorkers=0,
+            ioQueueSize=1,
+        ),
+        writerLogDir=tmp_path / "runs",
+    )
+
+    clearCachesV2()
+    batch = controller.initEvolution(dtype=torch.float32, device=torch.device("cpu"))
+    assert batch.geometryCacheKey is not None
+
+    evaluateBatchV2(batch, target, LossConfigV2(), targetMode="shared")
+    fine_count = len(_FINE_SHARED_CACHE_V2)
+    coarse_count = len(_COARSE_SHARED_CACHE_V2)
+
+    merged_batch = merge([batch.fetch(torch.tensor([0, 1])), batch.fetch(torch.tensor([2, 3]))])
+    assert merged_batch.geometryCacheKey == batch.geometryCacheKey
+
+    evaluateBatchV2(merged_batch, target, LossConfigV2(), targetMode="shared")
+
+    assert len(_FINE_SHARED_CACHE_V2) == fine_count
+    assert len(_COARSE_SHARED_CACHE_V2) == coarse_count
