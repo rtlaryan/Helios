@@ -608,14 +608,14 @@ class EvolutionController:
 
         device = templateBatch.device
         dtype = templateBatch.dtype
-        elementLocalPosition = templateBatch.elementLocalPosition.expand(batchSize, -1, -1).clone()
-        LLAPosition = templateBatch.LLAPosition.expand(batchSize, -1).clone()
-        ECEFPosition = templateBatch.ECEFPosition.expand(batchSize, -1).clone()
-        gain = templateBatch.gain.expand(batchSize).clone()
+        elementLocalPosition = templateBatch.elementLocalPosition.expand(batchSize, -1, -1)
+        LLAPosition = templateBatch.LLAPosition.expand(batchSize, -1)
+        ECEFPosition = templateBatch.ECEFPosition.expand(batchSize, -1)
+        gain = templateBatch.gain.expand(batchSize)
         elementMask = (
             None
             if templateBatch.elementMask is None
-            else templateBatch.elementMask.expand(batchSize, -1).clone()
+            else templateBatch.elementMask.expand(batchSize, -1)
         )
 
         if weightsType == "random":

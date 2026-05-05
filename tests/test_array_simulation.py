@@ -240,6 +240,62 @@ def test_array_response_v2_shared_grid_matches_chunked_v1_on_cuda() -> None:
     torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-4)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton v2")
+def test_array_response_v2_backward_matches_reference_on_cuda() -> None:
+    inputs = _make_response_inputs(torch.device("cuda"), batched_grid=False)
+    upstream = torch.randn((3, 5, 7), device="cuda")
+
+    reference_position = inputs["elementLocalPosition"].detach().clone().requires_grad_(True)
+    reference_weights = inputs["weights"].detach().clone().requires_grad_(True)
+    reference_azimuth = inputs["azimuth"].detach().clone().requires_grad_(True)
+    reference_elevation = inputs["elevation"].detach().clone().requires_grad_(True)
+    gain = inputs["gain"].detach().clone()
+
+    expected = _array_response_core_reference(
+        reference_position,
+        reference_weights,
+        float(inputs["wavelength"]),
+        reference_azimuth,
+        reference_elevation,
+        gain,
+        normalize=False,
+        dB=False,
+    )
+    (expected * upstream).sum().backward()
+
+    actual_position = inputs["elementLocalPosition"].detach().clone().requires_grad_(True)
+    actual_weights = inputs["weights"].detach().clone().requires_grad_(True)
+    actual_azimuth = inputs["azimuth"].detach().clone().requires_grad_(True)
+    actual_elevation = inputs["elevation"].detach().clone().requires_grad_(True)
+    batch = ArrayBatch(
+        elementLocalPosition=actual_position,
+        weights=actual_weights,
+        wavelength=float(inputs["wavelength"]),
+        gain=gain,
+        LLAPosition=torch.zeros((actual_position.shape[0], 3), device="cuda"),
+        ECEFPosition=torch.zeros((actual_position.shape[0], 3), device="cuda"),
+    )
+
+    actual = arrayResponseBatchSharedGridV2(
+        batch,
+        (actual_azimuth, actual_elevation),
+        normalize=False,
+        dB=False,
+    )
+    (actual * upstream).sum().backward()
+
+    torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(actual_position.grad, reference_position.grad, rtol=3e-3, atol=3e-3)
+    torch.testing.assert_close(actual_weights.grad, reference_weights.grad, rtol=3e-3, atol=3e-3)
+    torch.testing.assert_close(actual_azimuth.grad, reference_azimuth.grad, rtol=3e-3, atol=3e-3)
+    torch.testing.assert_close(
+        actual_elevation.grad,
+        reference_elevation.grad,
+        rtol=3e-3,
+        atol=3e-3,
+    )
+
+
 def test_array_response_v2_fails_on_cpu() -> None:
     inputs = _make_response_inputs(torch.device("cpu"), batched_grid=False)
     batch = _batch_from_inputs(inputs)

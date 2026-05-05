@@ -29,6 +29,7 @@ class CNNEncoder(TargetEncoder):
                     padding=padding,
                 )
             )
+            layers.append(nn.BatchNorm2d(outChannels))
             layers.append(make_activation(common.activation))
             if config.dropout > 0:
                 layers.append(nn.Dropout(config.dropout))

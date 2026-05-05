@@ -314,7 +314,7 @@ class PPOCorpusLoader:
             take = min(remaining, available)
             sliceStart = self.activeBlock.cursor
             sliceEnd = sliceStart + take
-            selected.extend(target.clone() for target in self.activeBlock.targets[sliceStart:sliceEnd])
+            selected.extend(self.activeBlock.targets[sliceStart:sliceEnd])
             self.activeBlock.cursor = sliceEnd
             self.targetsSeen += take
             remaining -= take
@@ -556,6 +556,8 @@ class PPOController:
         self.templateBatch = template.to(device)
         actionDim = 2 * self.templateBatch.N
         self.model = build_model(self.modelConfig, actionDim).to(device=device)
+        if hasattr(torch, "compile"):
+            self.model = torch.compile(self.model, mode="reduce-overhead")
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.config.learningRate)
 
     def _sample_rollout_targets(
@@ -569,15 +571,15 @@ class PPOController:
         elementMask = (
             None
             if template.elementMask is None
-            else template.elementMask.expand(batchSize, -1).clone()
+            else template.elementMask.expand(batchSize, -1)
         )
         return ArrayBatch(
-            elementLocalPosition=template.elementLocalPosition.expand(batchSize, -1, -1).clone(),
-            weights=template.weights.expand(batchSize, -1).clone(),
+            elementLocalPosition=template.elementLocalPosition.expand(batchSize, -1, -1),
+            weights=template.weights.expand(batchSize, -1),
             wavelength=template.wavelength,
-            gain=template.gain.expand(batchSize).clone(),
-            LLAPosition=template.LLAPosition.expand(batchSize, -1).clone(),
-            ECEFPosition=template.ECEFPosition.expand(batchSize, -1).clone(),
+            gain=template.gain.expand(batchSize),
+            LLAPosition=template.LLAPosition.expand(batchSize, -1),
+            ECEFPosition=template.ECEFPosition.expand(batchSize, -1),
             elementMask=elementMask,
         )
 
@@ -790,15 +792,15 @@ class PPOController:
         elementMask = (
             None
             if template.elementMask is None
-            else template.elementMask.expand(batchSize, -1).clone()
+            else template.elementMask.expand(batchSize, -1)
         )
         return ArrayBatch(
-            elementLocalPosition=template.elementLocalPosition.expand(batchSize, -1, -1).clone(),
+            elementLocalPosition=template.elementLocalPosition.expand(batchSize, -1, -1),
             weights=weights,
             wavelength=template.wavelength,
-            gain=template.gain.expand(batchSize).clone(),
-            LLAPosition=template.LLAPosition.expand(batchSize, -1).clone(),
-            ECEFPosition=template.ECEFPosition.expand(batchSize, -1).clone(),
+            gain=template.gain.expand(batchSize),
+            LLAPosition=template.LLAPosition.expand(batchSize, -1),
+            ECEFPosition=template.ECEFPosition.expand(batchSize, -1),
             elementMask=elementMask,
         )
 
@@ -809,13 +811,8 @@ class PPOController:
 
         with torch.no_grad():
             outputs = self.model(modelInputs)
-            self._ensure_finite("policyMean", outputs.policyMean, step=-1)
-            self._ensure_finite("logStd", self._bounded_log_std(outputs.logStd), step=-1)
-            self._ensure_finite("value", outputs.value, step=-1)
             actions = self._sample_actions(outputs.policyMean, outputs.logStd)
             oldLogProb = self._log_prob(outputs.policyMean, outputs.logStd, actions)
-            self._ensure_finite("actions", actions, step=-1)
-            self._ensure_finite("oldLogProb", oldLogProb, step=-1)
             weights = self._weights_from_actions(actions)
             arrayBatch = self._batch_from_weights(weights)
             if self.objectiveVersion == "v1":
@@ -1006,11 +1003,12 @@ class PPOController:
                     ).clamp_min(1e-8)
                 self._ensure_finite("advantages", advantages, step=step, corpusStatus=corpusStatus)
 
-                policyLossTotal = 0.0
-                valueLossTotal = 0.0
-                entropyTotal = 0.0
-                clipFracTotal = 0.0
-                approxKLTotal = 0.0
+                device = rollout.modelInputs.targetTensor.device
+                policyLossTotal = torch.tensor(0.0, device=device)
+                valueLossTotal = torch.tensor(0.0, device=device)
+                entropyTotal = torch.tensor(0.0, device=device)
+                clipFracTotal = torch.tensor(0.0, device=device)
+                approxKLTotal = torch.tensor(0.0, device=device)
                 optimizationSteps = 0
 
                 for _ in range(self.config.ppoEpochs):
@@ -1028,42 +1026,12 @@ class PPOController:
                         minibatchReturns = returns[ids]
 
                         outputs = self.model(minibatchInputs)
-                        self._ensure_finite(
-                            "policyMean",
-                            outputs.policyMean,
-                            step=step,
-                            corpusStatus=corpusStatus,
-                        )
-                        self._ensure_finite(
-                            "logStd",
-                            self._bounded_log_std(outputs.logStd),
-                            step=step,
-                            corpusStatus=corpusStatus,
-                        )
-                        self._ensure_finite(
-                            "value",
-                            outputs.value,
-                            step=step,
-                            corpusStatus=corpusStatus,
-                        )
                         newLogProb = self._log_prob(
                             outputs.policyMean,
                             outputs.logStd,
                             minibatchActions,
                         )
                         entropy = self._entropy(outputs.logStd).mean()
-                        self._ensure_finite(
-                            "newLogProb",
-                            newLogProb,
-                            step=step,
-                            corpusStatus=corpusStatus,
-                        )
-                        self._ensure_finite(
-                            "entropy",
-                            entropy.unsqueeze(0),
-                            step=step,
-                            corpusStatus=corpusStatus,
-                        )
                         logRatio = (newLogProb - minibatchOldLogProb).clamp(
                             min=_LOG_RATIO_MIN,
                             max=_LOG_RATIO_MAX,
@@ -1082,9 +1050,6 @@ class PPOController:
                             + self.config.valueLossCoef * valueLoss
                             - self.config.entropyCoef * entropy
                         )
-                        self._ensure_finite("ratio", ratio, step=step, corpusStatus=corpusStatus)
-                        self._ensure_finite("policyLoss", policyLoss.unsqueeze(0), step=step, corpusStatus=corpusStatus)
-                        self._ensure_finite("valueLoss", valueLoss.unsqueeze(0), step=step, corpusStatus=corpusStatus)
                         self._ensure_finite("loss", loss.unsqueeze(0), step=step, corpusStatus=corpusStatus)
 
                         self.optimizer.zero_grad(set_to_none=True)
@@ -1101,11 +1066,11 @@ class PPOController:
                             .mean()
                         )
                         approxKL = (minibatchOldLogProb - newLogProb).mean()
-                        policyLossTotal += float(policyLoss.item())
-                        valueLossTotal += float(valueLoss.item())
-                        entropyTotal += float(entropy.item())
-                        clipFracTotal += float(clipFrac.item())
-                        approxKLTotal += float(approxKL.item())
+                        policyLossTotal += policyLoss
+                        valueLossTotal += valueLoss
+                        entropyTotal += entropy
+                        clipFracTotal += clipFrac
+                        approxKLTotal += approxKL
                         optimizationSteps += 1
 
                 meanReward = float(rollout.reward.mean().item())
@@ -1129,15 +1094,16 @@ class PPOController:
                 logStd = self.model(rollout.modelInputs.index(slice(0, 1))).logStd.detach()
                 actionDim = logStd.shape[-1] // 2
                 corpusStatus = self.corpusLoader.status()
+                div = max(1, optimizationSteps)
                 summary = {
                     "meanReward": meanReward,
                     "bestReward": bestReward,
                     "meanTotalLoss": float(rollout.evaluation.totalLoss.mean().item()),
-                    "policyLoss": policyLossTotal / max(1, optimizationSteps),
-                    "valueLoss": valueLossTotal / max(1, optimizationSteps),
-                    "entropy": entropyTotal / max(1, optimizationSteps),
-                    "clipFrac": clipFracTotal / max(1, optimizationSteps),
-                    "approxKL": approxKLTotal / max(1, optimizationSteps),
+                    "policyLoss": float((policyLossTotal / div).item()),
+                    "valueLoss": float((valueLossTotal / div).item()),
+                    "entropy": float((entropyTotal / div).item()),
+                    "clipFrac": float((clipFracTotal / div).item()),
+                    "approxKL": float((approxKLTotal / div).item()),
                     "realStd": float(logStd[..., :actionDim].exp().mean().item()),
                     "imagStd": float(logStd[..., actionDim:].exp().mean().item()),
                     "corpusEpoch": float(corpusStatus["epoch"]),
